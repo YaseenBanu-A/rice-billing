@@ -29,7 +29,7 @@ Needs **Node.js 22.12 or newer**.
 
 ```bash
 npm install
-cp .env.example .env        # then set ADMIN_PASSWORD and JWT_SECRET
+cp .env.example .env        # then fill in DATABASE_URL, ADMIN_PASSWORD and JWT_SECRET
 npm run db:local            # local PostgreSQL on port 5433 (no install needed); keep it running
 npm run db:deploy           # create the tables (in a second terminal)
 npm run dev                 # app at http://localhost:5173, API at http://localhost:3001
@@ -45,7 +45,7 @@ To run it the way it runs online: `npm run build` and then `npm start` (one addr
 
 | Variable | Required | Purpose |
 | --- | --- | --- |
-| `DATABASE_URL` | production | PostgreSQL connection string. Locally it defaults to the `db:local` database |
+| `DATABASE_URL` | yes | PostgreSQL connection string. Locally, `npm run db:local` creates its database with the login, port and name given here (and a `_test` copy for the tests) |
 | `JWT_SECRET` | production | Long random string (32+ characters) that signs sign-in tokens |
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | first start | First administrator. Only used while there are no users |
 | `TZ` | – | Shop time zone for "today" and date filters. Default `Asia/Kolkata` |

@@ -1,0 +1,439 @@
+// A.J RICE TRADERS — billing database (PostgreSQL)
+// Money is Decimal(14,2), quantities Decimal(14,3). Bills, purchases and returns keep their own copy of
+// names, prices and customer details so later edits to products or customers never change history.
+
+generator client {
+  provider               = "prisma-client"
+  output                 = "../server/generated/prisma"
+  moduleFormat           = "esm"
+  importFileExtension    = "ts"
+  generatedFileExtension = "ts"
+  runtime                = "nodejs"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/* ---------------- users & security ---------------- */
+
+enum Role {
+  ADMIN
+  MANAGER
+  CASHIER
+}
+
+model User {
+  id           String    @id @default(uuid()) @db.Uuid
+  username     String    @unique
+  name         String
+  passwordHash String
+  role         Role      @default(CASHIER)
+  active       Boolean   @default(true)
+  /// bumped on password change / deactivation: invalidates every issued token
+  tokenVersion Int       @default(0)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  refreshTokens RefreshToken[]
+  auditLogs     AuditLog[]
+  invoices      Invoice[]       @relation("InvoiceCreatedBy")
+  payments      Payment[]
+  purchases     Purchase[]
+  expenses      Expense[]
+  returns       SalesReturn[]
+  movements     StockMovement[]
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  /// sha256 of the token; the token itself is never stored
+  tokenHash  String    @unique
+  /// all tokens from one sign-in share a family; reuse of a rotated token revokes the family
+  family     String    @db.Uuid
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  userAgent  String?
+  ip         String?
+  createdAt  DateTime  @default(now())
+
+  @@index([userId])
+  @@index([family])
+}
+
+model AuditLog {
+  id        BigInt   @id @default(autoincrement())
+  userId    String?  @db.Uuid
+  user      User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  action    String
+  entity    String
+  entityId  String?
+  details   Json?
+  ip        String?
+  createdAt DateTime @default(now())
+
+  @@index([createdAt])
+  @@index([entity, entityId])
+}
+
+/* ---------------- settings ---------------- */
+
+model CompanySettings {
+  id                 Int      @id @default(1)
+  businessName       String
+  businessType       String   @default("")
+  address            String   @default("")
+  phone              String   @default("")
+  email              String   @default("")
+  gstin              String   @default("")
+  logo               String?
+  defaultGst         Decimal  @default(5) @db.Decimal(5, 2)
+  invoicePrefix      String   @default("INV-")
+  purchasePrefix     String   @default("PUR-")
+  returnPrefix       String   @default("RET-")
+  footerMessage      String   @default("")
+  currency           String   @default("INR")
+  gstInclusive       Boolean  @default(false)
+  invoiceFormat      String   @default("a4")
+  allowNegativeStock Boolean  @default(false)
+  updatedAt          DateTime @updatedAt
+}
+
+model TaxRate {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String
+  rate      Decimal  @unique @db.Decimal(5, 2)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+}
+
+/// Sequential document numbers (invoice, purchase, return). Incremented inside the creating transaction.
+model Counter {
+  name  String @id
+  value Int
+}
+
+/* ---------------- master data ---------------- */
+
+model Customer {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String
+  phone       String
+  phoneDigits String   @unique
+  email       String?
+  address     String?
+  gstin       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  invoices Invoice[]
+
+  @@index([name])
+}
+
+model Supplier {
+  id          String   @id @default(uuid()) @db.Uuid
+  name        String
+  phone       String   @default("")
+  phoneDigits String?  @unique
+  email       String?
+  address     String?
+  gstin       String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  purchases Purchase[]
+
+  @@index([name])
+}
+
+model Category {
+  id          String    @id @default(uuid()) @db.Uuid
+  name        String    @unique
+  description String?
+  createdAt   DateTime  @default(now())
+  products    Product[]
+}
+
+model Product {
+  id            String    @id @default(uuid()) @db.Uuid
+  name          String
+  sku           String    @unique
+  categoryId    String?   @db.Uuid
+  category      Category? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  /// rice variety, e.g. Ponni, Sona Masoori, Basmati
+  variety       String?
+  brand         String?
+  hsnCode       String    @default("1006")
+  unit          String    @default("Kg")
+  /// kg per bag, so bags can be converted to weight
+  bagWeight     Decimal?  @db.Decimal(10, 3)
+  price         Decimal   @db.Decimal(14, 2)
+  purchasePrice Decimal   @default(0) @db.Decimal(14, 2)
+  gstRate       Decimal   @db.Decimal(5, 2)
+  stock         Decimal   @default(0) @db.Decimal(14, 3)
+  reorderLevel  Decimal   @default(0) @db.Decimal(14, 3)
+  /// false = archived (kept because bills or stock history refer to it)
+  active        Boolean   @default(true)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  movements     StockMovement[]
+  invoiceItems  InvoiceItem[]
+  purchaseItems PurchaseItem[]
+  returnItems   SalesReturnItem[]
+
+  @@index([name])
+  @@index([categoryId])
+}
+
+enum MovementType {
+  OPENING
+  PURCHASE
+  PURCHASE_CANCEL
+  SALE
+  SALE_EDIT
+  SALE_CANCEL
+  SALE_RETURN
+  ADJUSTMENT
+}
+
+model StockMovement {
+  id           BigInt       @id @default(autoincrement())
+  productId    String       @db.Uuid
+  product      Product      @relation(fields: [productId], references: [id], onDelete: Cascade)
+  type         MovementType
+  /// positive = stock in, negative = stock out
+  quantity     Decimal      @db.Decimal(14, 3)
+  balanceAfter Decimal      @db.Decimal(14, 3)
+  invoiceId    String?      @db.Uuid
+  purchaseId   String?      @db.Uuid
+  returnId     String?      @db.Uuid
+  note         String?
+  userId       String?      @db.Uuid
+  user         User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt    DateTime     @default(now())
+
+  @@index([productId, createdAt])
+  @@index([createdAt])
+}
+
+/* ---------------- sales ---------------- */
+
+model Invoice {
+  id              String    @id @default(uuid()) @db.Uuid
+  invoiceNo       String    @unique
+  date            DateTime
+  /// yyyy-mm-dd in the shop's time zone, for day filters and reports
+  dateKey         String
+  customerId      String?   @db.Uuid
+  customer        Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  customerName    String
+  customerPhone   String    @default("")
+  customerAddress String?
+  customerGstin   String?
+  discountType    String
+  discountValue   Decimal   @default(0) @db.Decimal(14, 2)
+  gstInclusive    Boolean   @default(false)
+  paymentMethod   String
+  subtotal        Decimal   @db.Decimal(14, 2)
+  discount        Decimal   @db.Decimal(14, 2)
+  taxable         Decimal   @db.Decimal(14, 2)
+  gst             Decimal   @db.Decimal(14, 2)
+  grandTotal      Decimal   @db.Decimal(14, 2)
+  /// sum of payments minus refunds
+  amountPaid      Decimal   @default(0) @db.Decimal(14, 2)
+  /// cash handed back when more than the total was tendered (shown on the receipt)
+  changeReturned  Decimal   @default(0) @db.Decimal(14, 2)
+  returnTotal     Decimal   @default(0) @db.Decimal(14, 2)
+  balance         Decimal   @db.Decimal(14, 2)
+  status          String
+  notes           String?
+  cancelledAt     DateTime?
+  cancelReason    String?
+  /// optimistic lock: edits must send the version they started from
+  version         Int       @default(1)
+  /// idempotency key from the client, so a double-click or retry can't create two bills
+  clientRequestId String?   @unique
+  createdById     String?   @db.Uuid
+  createdBy       User?     @relation("InvoiceCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  items    InvoiceItem[]
+  payments Payment[]
+  returns  SalesReturn[]
+
+  @@index([dateKey])
+  @@index([status])
+  @@index([customerId])
+  @@index([date])
+}
+
+model InvoiceItem {
+  id        String   @id @default(uuid()) @db.Uuid
+  invoiceId String   @db.Uuid
+  invoice   Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  position  Int
+  productId String?  @db.Uuid
+  product   Product? @relation(fields: [productId], references: [id], onDelete: SetNull)
+  name      String
+  sku       String   @default("")
+  hsnCode   String   @default("")
+  price     Decimal  @db.Decimal(14, 2)
+  quantity  Decimal  @db.Decimal(14, 3)
+  unit      String   @default("")
+  bags      Decimal? @db.Decimal(10, 3)
+  gstRate   Decimal  @db.Decimal(5, 2)
+
+  returnItems SalesReturnItem[]
+
+  @@index([invoiceId])
+  @@index([productId])
+}
+
+enum PaymentKind {
+  PAYMENT
+  REFUND
+}
+
+/// Money received for an invoice or paid out for a purchase. Refunds are stored as negative amounts.
+model Payment {
+  id              String      @id @default(uuid()) @db.Uuid
+  invoiceId       String?     @db.Uuid
+  invoice         Invoice?    @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  purchaseId      String?     @db.Uuid
+  purchase        Purchase?   @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  kind            PaymentKind @default(PAYMENT)
+  amount          Decimal     @db.Decimal(14, 2)
+  method          String
+  date            DateTime
+  dateKey         String
+  reference       String?
+  note            String?
+  clientRequestId String?     @unique
+  userId          String?     @db.Uuid
+  user            User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt       DateTime    @default(now())
+
+  @@index([invoiceId])
+  @@index([purchaseId])
+  @@index([dateKey])
+}
+
+model SalesReturn {
+  id           String            @id @default(uuid()) @db.Uuid
+  returnNo     String            @unique
+  invoiceId    String            @db.Uuid
+  invoice      Invoice           @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  date         DateTime
+  dateKey      String
+  reason       String?
+  total        Decimal           @db.Decimal(14, 2)
+  taxable      Decimal           @db.Decimal(14, 2)
+  gst          Decimal           @db.Decimal(14, 2)
+  refund       Decimal           @default(0) @db.Decimal(14, 2)
+  refundMethod String?
+  userId       String?           @db.Uuid
+  user         User?             @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt    DateTime          @default(now())
+  items        SalesReturnItem[]
+
+  @@index([invoiceId])
+  @@index([dateKey])
+}
+
+model SalesReturnItem {
+  id            String      @id @default(uuid()) @db.Uuid
+  returnId      String      @db.Uuid
+  salesReturn   SalesReturn @relation(fields: [returnId], references: [id], onDelete: Cascade)
+  invoiceItemId String      @db.Uuid
+  invoiceItem   InvoiceItem @relation(fields: [invoiceItemId], references: [id], onDelete: Cascade)
+  productId     String?     @db.Uuid
+  product       Product?    @relation(fields: [productId], references: [id], onDelete: SetNull)
+  name          String
+  quantity      Decimal     @db.Decimal(14, 3)
+  amount        Decimal     @db.Decimal(14, 2)
+
+  @@index([returnId])
+  @@index([invoiceItemId])
+}
+
+/* ---------------- purchases ---------------- */
+
+model Purchase {
+  id                String    @id @default(uuid()) @db.Uuid
+  purchaseNo        String    @unique
+  supplierId        String    @db.Uuid
+  supplier          Supplier  @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  supplierInvoiceNo String?
+  date              DateTime
+  dateKey           String
+  discountType      String    @default("amount")
+  discountValue     Decimal   @default(0) @db.Decimal(14, 2)
+  gstInclusive      Boolean   @default(false)
+  subtotal          Decimal   @db.Decimal(14, 2)
+  discount          Decimal   @db.Decimal(14, 2)
+  taxable           Decimal   @db.Decimal(14, 2)
+  gst               Decimal   @db.Decimal(14, 2)
+  grandTotal        Decimal   @db.Decimal(14, 2)
+  amountPaid        Decimal   @default(0) @db.Decimal(14, 2)
+  balance           Decimal   @db.Decimal(14, 2)
+  status            String
+  notes             String?
+  cancelledAt       DateTime?
+  cancelReason      String?
+  clientRequestId   String?   @unique
+  userId            String?   @db.Uuid
+  user              User?     @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  items    PurchaseItem[]
+  payments Payment[]
+
+  @@index([supplierId])
+  @@index([dateKey])
+}
+
+model PurchaseItem {
+  id         String   @id @default(uuid()) @db.Uuid
+  purchaseId String   @db.Uuid
+  purchase   Purchase @relation(fields: [purchaseId], references: [id], onDelete: Cascade)
+  position   Int
+  productId  String   @db.Uuid
+  product    Product  @relation(fields: [productId], references: [id], onDelete: Restrict)
+  name       String
+  quantity   Decimal  @db.Decimal(14, 3)
+  unit       String   @default("")
+  bags       Decimal? @db.Decimal(10, 3)
+  price      Decimal  @db.Decimal(14, 2)
+  gstRate    Decimal  @db.Decimal(5, 2)
+
+  @@index([purchaseId])
+  @@index([productId])
+}
+
+/* ---------------- expenses ---------------- */
+
+model Expense {
+  id              String   @id @default(uuid()) @db.Uuid
+  date            DateTime
+  dateKey         String
+  category        String
+  description     String   @default("")
+  amount          Decimal  @db.Decimal(14, 2)
+  paymentMethod   String
+  reference       String?
+  clientRequestId String?  @unique
+  userId          String?  @db.Uuid
+  user            User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([dateKey])
+  @@index([category])
+}

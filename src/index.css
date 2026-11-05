@@ -1,0 +1,232 @@
+@import 'tailwindcss';
+
+/* Theme is chosen with a `dark` class on <html> (see src/lib/theme.ts) */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: 'Inter', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
+
+  --color-brand-50: #eef3ff;
+  --color-brand-100: #dce6ff;
+  --color-brand-200: #bccdff;
+  --color-brand-300: #8eabff;
+  --color-brand-400: #5d80f7;
+  --color-brand-500: #3a5ef0;
+  --color-brand-600: #2952e3;
+  --color-brand-700: #1f3fc0;
+  --color-brand-800: #1e3799;
+  --color-brand-900: #1d3279;
+
+  --color-ink-950: #0a0f1e;
+  --color-ink-900: #0f172a;
+  --color-ink-700: #334155;
+  --color-ink-500: #64748b;
+  --color-ink-400: #94a3b8;
+  --color-ink-300: #cbd5e1;
+
+  /* card / input background */
+  --color-surface: #ffffff;
+  --color-page: #f4f6fa;
+
+  --shadow-card: 0 0 0 1px rgb(15 23 42 / 0.03), 0 1px 2px -1px rgb(15 23 42 / 0.06), 0 4px 12px -4px rgb(15 23 42 / 0.05);
+  --shadow-lift: 0 0 0 1px rgb(15 23 42 / 0.04), 0 2px 4px -1px rgb(15 23 42 / 0.06), 0 12px 28px -8px rgb(15 23 42 / 0.12);
+  --shadow-pop: 0 10px 30px -10px rgb(15 23 42 / 0.25), 0 4px 10px -4px rgb(15 23 42 / 0.08);
+}
+
+/* ---------- Dark theme ----------
+   Redefines the light-UI colours so every component follows without per-component dark: classes.
+   Already-dark parts (sidebar, banner, grand total) use ink-950 / slate-300+ / white, which stay put.
+   The print/PDF invoice uses neutral/black/white and is unaffected. */
+.dark {
+  color-scheme: dark;
+
+  --color-page: #0b1020;
+  --color-surface: #121a2b;
+
+  --color-slate-50: #172136;
+  --color-slate-100: #1c273d;
+  --color-slate-200: #273349;
+
+  --color-ink-950: #060912;
+  --color-ink-900: #e8ecf4;
+  --color-ink-700: #c3cad8;
+  --color-ink-500: #8d98ad;
+  --color-ink-400: #6d7a93;
+  --color-ink-300: #3a4862;
+
+  --color-brand-50: #16214a;
+  --color-brand-100: #1b2a5c;
+  --color-brand-200: #263a7e;
+  --color-brand-600: #4468f2;
+  --color-brand-700: #a3b6ff;
+
+  --color-emerald-50: #0d2620;
+  --color-emerald-200: #14503c;
+  --color-emerald-600: #34d399;
+  --color-emerald-700: #6ee7b7;
+
+  --color-amber-50: #291f0c;
+  --color-amber-200: #4e3a12;
+  --color-amber-600: #fbbf24;
+  --color-amber-700: #fcd34d;
+  --color-amber-800: #fde68a;
+
+  --color-red-50: #2b1318;
+  --color-red-200: #5a2029;
+  --color-red-300: #7a2a35;
+  --color-red-400: #e5484d;
+  --color-red-600: #ef4444;
+  --color-red-700: #fca5a5;
+
+  --color-violet-50: #1f1a3d;
+  --color-violet-200: #3b2f6e;
+  --color-violet-700: #c4b5fd;
+  --color-rose-50: #2d1420;
+  --color-rose-200: #5c2340;
+  --color-rose-700: #fda4af;
+  --color-sky-50: #0c2233;
+  --color-sky-200: #164462;
+  --color-sky-700: #7dd3fc;
+
+  --shadow-card: 0 0 0 1px rgb(255 255 255 / 0.02), 0 1px 2px 0 rgb(0 0 0 / 0.35), 0 6px 16px -6px rgb(0 0 0 / 0.4);
+  --shadow-lift: 0 0 0 1px rgb(255 255 255 / 0.04), 0 12px 28px -8px rgb(0 0 0 / 0.6);
+  --shadow-pop: 0 0 0 1px rgb(255 255 255 / 0.06), 0 16px 40px -12px rgb(0 0 0 / 0.7);
+}
+
+html,
+body {
+  background: var(--color-page);
+  color: var(--color-ink-900);
+  -webkit-font-smoothing: antialiased;
+  font-feature-settings: 'cv11', 'ss01';
+}
+
+#root {
+  /* soft brand wash behind the content area */
+  background:
+    radial-gradient(1200px 400px at 70% -120px, rgb(58 94 240 / 0.07), transparent 70%),
+    var(--color-page);
+  min-height: 100vh;
+}
+
+.dark #root {
+  background:
+    radial-gradient(1200px 420px at 70% -120px, rgb(58 94 240 / 0.14), transparent 70%),
+    var(--color-page);
+}
+
+/* smooth switch between themes, without animating every hover */
+html.theme-switching *,
+html.theme-switching *::before,
+html.theme-switching *::after {
+  transition:
+    background-color 200ms ease,
+    border-color 200ms ease,
+    color 200ms ease !important;
+}
+
+::selection {
+  background: rgb(58 94 240 / 0.18);
+}
+
+/* Hide number spinners for a cleaner table look */
+input[type='number']::-webkit-inner-spin-button,
+input[type='number']::-webkit-outer-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type='number'] {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.animate-toast-in {
+  animation: toast-in 180ms ease-out;
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+.animate-fade-in {
+  animation: fade-in 150ms ease-out;
+}
+
+/* ---------- Print ---------- */
+#print-root {
+  display: none;
+}
+
+/* The page itself has no margin: the invoice brings its own frame (.print-frame), so it looks the same
+   whatever the browser's "Margins" option or the printer's defaults are. PrintHost overrides the size per format. */
+@page {
+  size: A4;
+  margin: 0;
+}
+
+/* PDF export draws text onto a canvas, which ignores OpenType features (alternate glyphs, tabular digits).
+   Turning them off here keeps the on-page layout identical to what gets drawn, so no stray gaps appear. */
+.pdf-capture,
+.pdf-capture * {
+  font-feature-settings: normal !important;
+  font-variant-numeric: normal !important;
+}
+
+/* Print frame: margins built into the invoice (outside @media print so the receipt length can be measured) */
+.print-frame {
+  width: 100%;
+  border-collapse: collapse;
+}
+/* only the frame's own cells: the invoice's tables keep their spacing */
+.print-frame > thead > tr > td,
+.print-frame > tfoot > tr > td {
+  padding: 0;
+}
+/* repeated on every printed page by the browser (thead/tfoot) */
+.print-frame-space {
+  height: var(--frame, 12mm);
+}
+.print-frame-body {
+  padding: 0 var(--frame, 12mm) !important;
+}
+#print-root .invoice {
+  box-sizing: border-box;
+  width: 100% !important;
+  max-width: 100% !important;
+  overflow-wrap: anywhere;
+}
+
+@media print {
+  html,
+  body {
+    background: #fff !important;
+  }
+  #root {
+    display: none !important;
+  }
+  #print-root {
+    display: block !important;
+  }
+  * {
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+}

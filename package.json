@@ -1,0 +1,61 @@
+{
+  "name": "aj-rice-billing",
+  "private": true,
+  "version": "2.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k -n api,web -c blue,magenta \"npm:dev:api\" \"npm:dev:web\"",
+    "dev:api": "node --experimental-strip-types --disable-warning=ExperimentalWarning --watch server/index.ts",
+    "dev:web": "vite",
+    "db:local": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/local-db.ts",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:generate": "prisma generate",
+    "postinstall": "prisma generate",
+    "build": "prisma generate && tsc -b && vite build",
+    "start": "prisma migrate deploy && node --experimental-strip-types --disable-warning=ExperimentalWarning server/index.ts",
+    "start:server": "node --experimental-strip-types --disable-warning=ExperimentalWarning server/index.ts",
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test --test-concurrency=1 tests/api.test.ts",
+    "lint": "oxlint",
+    "user:reset-password": "node --experimental-strip-types --disable-warning=ExperimentalWarning scripts/reset-password.ts"
+  },
+  "dependencies": {
+    "@prisma/adapter-pg": "^7.10.1",
+    "@prisma/client": "^7.10.1",
+    "cors": "^2.8.6",
+    "express": "^5.3.0",
+    "express-rate-limit": "^8.7.3",
+    "helmet": "^8.3.0",
+    "html2canvas-pro": "^2.5.2",
+    "jsonwebtoken": "^9.0.3",
+    "jspdf": "^4.2.1",
+    "lucide-react": "^1.61.0",
+    "pg": "^8.23.1",
+    "prisma": "^7.10.1",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "socket.io": "^4.8.4",
+    "socket.io-client": "^4.8.4"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^24.19.2",
+    "@types/pg": "^8.23.1",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "concurrently": "^10.0.6",
+    "embedded-postgres": "^17.11.0-beta.19",
+    "oxlint": "^1.88.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "~6.0.3",
+    "vite": "^8.3.4"
+  },
+  "engines": {
+    "node": ">=22.12"
+  },
+  "description": "Billing, inventory and accounts for A.J RICE TRADERS"
+}
