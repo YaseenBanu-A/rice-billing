@@ -9,9 +9,9 @@ databases:
     databaseName: ajrice
     user: ajrice
     region: singapore # closest Render region to Tamil Nadu
-    # Paid plan: data is kept permanently with daily backups (point-in-time recovery on higher plans).
-    # Do NOT use the free plan for real business data: free databases expire after 30 days.
-    plan: basic-256mb
+    # FREE plan: expires 30 days after creation (deleted after a grace period unless upgraded), 1 GB storage,
+    # no backups. Download a backup regularly (Settings → Backup) and upgrade to a paid plan before relying on it.
+    plan: free
     postgresMajorVersion: "17"
     ipAllowList: [] # no access from the internet; only Render services in this account can connect
 
@@ -20,8 +20,8 @@ services:
     name: aj-rice-billing
     runtime: node
     region: singapore
-    # Starter stays awake. "free" also works, but sleeps after 15 minutes idle (first visit then takes ~1 minute).
-    plan: starter
+    # FREE plan: sleeps after 15 minutes without visits; the next visit wakes it (takes about a minute).
+    plan: free
     # npm ci also runs `prisma generate` (postinstall); build compiles the app
     buildCommand: npm ci --include=dev && npm run build
     # applies any pending database migrations (safe to repeat), then starts the server
