@@ -1,6 +1,6 @@
-# A.J RICE TRADERS — Billing
+# Aamina Boutique Collections — Billing
 
-Billing, stock and accounts for **A.J RICE TRADERS**, Rice Wholesale and Retail Trading, Pollachi (GSTIN 33ACRPJ6462A1ZQ).
+Billing for **Aamina Boutique Collections** (owner: Shifna · 7338772521 · Pulinthope, Chennai): manual-entry bills, boutique invoices (A4, A5, 80mm receipt), PDF and printing.
 Several people can use it at once from any phone or computer. Bills, payments and stock update on every open screen instantly.
 
 | Part | Technology |
@@ -35,7 +35,7 @@ npm run db:deploy           # create the tables (in a second terminal)
 npm run dev                 # app at http://localhost:5173, API at http://localhost:3001
 ```
 
-On first start the server creates the company settings for A.J RICE TRADERS, the GST rates, and the administrator from `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env`. The database starts empty: no sample data.
+On first start the server creates the shop settings for Aamina Boutique Collections, the GST rates, and the administrator from `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env`. The database starts empty: no sample data.
 
 **Forgot a password?** Run `npm run user:reset-password -- admin` (on Render: web service → Shell). It prints a new random password and signs that user out everywhere.
 
@@ -148,5 +148,7 @@ All endpoints are under `/api`. Every one except `/health` and `/auth/*` needs `
 | Expenses | `GET/POST /expenses`, `PUT/DELETE /expenses/:id`, `GET /expenses/categories` |
 | Reports | `GET /reports/dashboard`, `GET /reports/summary?from=&to=` |
 | Data | `GET /backup`, `POST /restore`, `POST /reset` (body `{ "confirm": "RESET" }`) |
-#   r i c e - b i l l i n g  
+#   r i c e - b i l l i n g 
+ 
+ #   a a m i n a b o u t i q u e  
  
