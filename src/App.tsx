@@ -5,6 +5,7 @@ import { Toaster } from './components/Toaster'
 import { BillsHistory } from './pages/BillsHistory'
 import { CreateBill } from './pages/CreateBill'
 import { Dashboard } from './pages/Dashboard'
+import { Inventory } from './pages/Inventory'
 import { Settings } from './pages/Settings'
 import { AppProvider, useApp } from './store/AppContext'
 
@@ -29,6 +30,7 @@ function Shell() {
         {page === 'dashboard' && <Dashboard />}
         {page === 'create' && <CreateBill />}
         {page === 'history' && <BillsHistory />}
+        {page === 'inventory' && <Inventory />}
         {page === 'settings' && <Settings />}
       </Layout>
       <Toaster />

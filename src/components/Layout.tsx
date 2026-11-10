@@ -1,4 +1,4 @@
-import { CalendarDays, History, LayoutDashboard, LogOut, Menu, Plus, ReceiptText, Settings as SettingsIcon, X, type LucideIcon } from 'lucide-react'
+import { CalendarDays, History, LayoutDashboard, LogOut, Menu, Package, Plus, ReceiptText, Settings as SettingsIcon, X, type LucideIcon } from 'lucide-react'
 import { useState, type ReactNode } from 'react'
 import { DEMO } from '../lib/api'
 import { formatMoney } from '../lib/format'
@@ -15,6 +15,7 @@ const NAV: { page: Page; label: string; icon: LucideIcon; hint?: string }[] = [
   { page: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { page: 'create', label: 'Create Bill', icon: ReceiptText, hint: 'N' },
   { page: 'history', label: 'Bills History', icon: History },
+  { page: 'inventory', label: 'Inventory', icon: Package },
   { page: 'settings', label: 'Settings', icon: SettingsIcon },
 ]
 
@@ -22,11 +23,13 @@ const TITLES: Record<Page, string> = {
   dashboard: 'Dashboard',
   create: 'Create Bill',
   history: 'Bills History',
+  inventory: 'Inventory',
   settings: 'Settings',
 }
 
 function NavList({ onNavigate }: { onNavigate?: () => void }) {
-  const { page, navigate } = useApp()
+  const { page, navigate, products } = useApp()
+  const lowStock = products.filter((p) => p.stock <= p.reorderLevel).length
   return (
     <nav className="flex flex-col gap-1">
       {NAV.map(({ page: p, label, icon: Icon, hint }) => {
@@ -48,6 +51,11 @@ function NavList({ onNavigate }: { onNavigate?: () => void }) {
             {active && <span className="absolute top-2.5 bottom-2.5 -left-4 w-[3px] rounded-r-full bg-brand-400 shadow-[0_0_12px_2px_rgb(93_128_247/0.6)]" />}
             <Icon className={cn('size-[18px] transition-colors', active ? 'text-brand-300' : 'text-slate-500 group-hover:text-slate-300')} strokeWidth={1.9} />
             {label}
+            {p === 'inventory' && lowStock > 0 && (
+              <span title={`${lowStock} low on stock`} className="ml-auto rounded-full bg-amber-400/15 px-1.5 text-[10px] leading-4 font-semibold text-amber-300 ring-1 ring-amber-400/30 ring-inset">
+                {lowStock}
+              </span>
+            )}
             {hint && (
               <kbd className="ml-auto hidden rounded-md border border-white/10 bg-white/5 px-1.5 text-[10px] font-medium text-slate-400 lg:inline">{hint}</kbd>
             )}

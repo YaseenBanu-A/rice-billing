@@ -1,6 +1,6 @@
-# Aamina Boutique Collections — Billing
+# A.J RICE TRADERS — Billing
 
-Billing for **Aamina Boutique Collections** (owner: Shifna · 7338772521 · Pulinthope, Chennai): manual-entry bills, boutique invoices (A4, A5, 80mm receipt), PDF and printing.
+Billing, stock and accounts for **A.J RICE TRADERS**, Rice Wholesale and Retail Trading, Pollachi (GSTIN 33ACRPJ6462A1ZQ).
 Several people can use it at once from any phone or computer. Bills, payments and stock update on every open screen instantly.
 
 | Part | Technology |
@@ -13,7 +13,7 @@ Several people can use it at once from any phone or computer. Bills, payments an
 
 ## What it does
 
-The app is the original billing screen set: **Dashboard, Create Bill, Bills History and Settings**, with the same design and the same billing calculations. Behind it there is now a proper server and database:
+The app is the original billing screen set: **Dashboard, Create Bill, Bills History, Inventory and Settings**, with the same design and the same billing calculations. Behind it there is now a proper server and database:
 
 - All bills, customers and settings are stored permanently in PostgreSQL, so nothing depends on the browser.
 - Several people can bill at once from any phone or computer. A bill made on one counter appears on every other open screen without refreshing.
@@ -21,7 +21,9 @@ The app is the original billing screen set: **Dashboard, Create Bill, Bills Hist
 - The server assigns invoice numbers (`INV-001`, `INV-002`, …) inside a database transaction, so they are never duplicated, even when two counters save at the same moment. A double click or a retry saves the bill once.
 - The server recalculates every total and GST amount and records who did what (activity log).
 
-The server also contains APIs for stock, purchases, suppliers, expenses, reports and user management (see API below). They are not shown in the app.
+**Inventory** adds, edits and deletes products (name, SKU, category, package size, selling price, stock, minimum stock level) with low-stock alerts. Create Bill searches these products by name, SKU or product ID and uses their saved price; saving a bill deducts the sold quantity from stock in the same database transaction, and a sale larger than the available stock is refused.
+
+The server also contains APIs for purchases, suppliers, expenses, reports and user management (see API below). They are not shown in the app.
 
 ## Run it on your computer
 
@@ -35,7 +37,7 @@ npm run db:deploy           # create the tables (in a second terminal)
 npm run dev                 # app at http://localhost:5173, API at http://localhost:3001
 ```
 
-On first start the server creates the shop settings for Aamina Boutique Collections, the GST rates, and the administrator from `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env`. The database starts empty: no sample data.
+On first start the server creates the company settings for A.J RICE TRADERS, the GST rates, and the administrator from `ADMIN_USERNAME` / `ADMIN_PASSWORD` in `.env`. The database starts empty: no sample data.
 
 **Forgot a password?** Run `npm run user:reset-password -- admin` (on Render: web service → Shell). It prints a new random password and signs that user out everywhere.
 
@@ -150,5 +152,4 @@ All endpoints are under `/api`. Every one except `/health` and `/auth/*` needs `
 | Data | `GET /backup`, `POST /restore`, `POST /reset` (body `{ "confirm": "RESET" }`) |
 #   r i c e - b i l l i n g 
  
- #   a a m i n a b o u t i q u e  
  

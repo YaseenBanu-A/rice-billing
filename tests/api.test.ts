@@ -449,3 +449,149 @@ describe('persistence & backup', () => {
     assert.equal((await call('GET', '/invoices/next', { token: admin.token })).body.invoiceNo, 'INV-014') // deleted INV-012 stays used after a restore
   })
 })
+
+/* ---------- Inventory page ↔ bill screen (POS) ---------- */
+
+describe('inventory module connected to the bill screen', () => {
+  let counter = { token: '', cookie: '' }
+  const inv: Record<string, string> = {}
+  const sale = (items: object[], extra: object = {}) => ({
+    customer: { name: 'Walk-in Customer', phone: '' },
+    items,
+    discountType: 'percent',
+    discountValue: 0,
+    gstInclusive: false,
+    paymentMethod: 'Cash',
+    amountPaid: 0,
+    clientRequestId: uuid(),
+    ...extra,
+  })
+  const line = (p: { id: string; name: string; sku: string; gstRate: number }, quantity: number, unit: string, price: number) => ({
+    productId: p.id,
+    name: p.name,
+    sku: p.sku,
+    price,
+    quantity,
+    unit,
+    gstRate: p.gstRate,
+  })
+
+  test('a product added from the Inventory form is saved without any manual database work', async () => {
+    const u = await call('POST', '/users', { token: admin.token, body: { username: 'counter2', name: 'Counter 2', role: 'CASHIER', password: 'Password-123' } })
+    assert.equal(u.status, 201, JSON.stringify(u.body))
+    counter = await login('counter2', 'Password-123')
+
+    // exactly what the Inventory "Add Product" form sends
+    const cat = await call('POST', '/categories', { token: manager.token, body: { name: 'Packed Rice' } })
+    const r = await call('POST', '/products', {
+      token: manager.token,
+      body: { name: 'Sona Masoori Rice 5kg', sku: 'SONA-5', categoryId: cat.body.id, hsnCode: '1006', unit: 'Bag', bagWeight: 5, price: 320, purchasePrice: 290, gstRate: 5, reorderLevel: 5, openingStock: 20, active: true },
+    })
+    assert.equal(r.status, 201, JSON.stringify(r.body))
+    assert.equal(r.body.stock, 20)
+    assert.equal(r.body.bagWeight, 5)
+    assert.equal(r.body.categoryName, 'Packed Rice')
+    inv.sona = r.body.id
+    // a cashier can see but not change inventory
+    assert.equal((await call('POST', '/products', { token: counter.token, body: { name: 'X', price: 1, gstRate: 5 } })).status, 403)
+    assert.equal((await call('PUT', `/products/${inv.sona}`, { token: counter.token, body: { name: 'X', price: 1, gstRate: 5 } })).status, 403)
+  })
+
+  test('the new product is in the bill screen product list and found by name, SKU or ID', async () => {
+    const { searchProducts, exactProduct, priceFor } = await import('../src/lib/inventory.ts')
+    const boot = (await call('GET', '/bootstrap', { token: counter.token })).body
+    const fromBoot = boot.products.find((p: { id: string }) => p.id === inv.sona)
+    assert.ok(fromBoot, 'product is loaded by the bill screen at start-up')
+    const list = (await call('GET', '/products', { token: counter.token })).body
+    assert.equal(searchProducts(list, 'sona')[0].id, inv.sona)
+    assert.equal(searchProducts(list, 'masoori')[0]?.id, inv.sona)
+    // package size finds every product packed in that size
+    assert.ok(searchProducts(list, '5kg').some((p: { id: string }) => p.id === inv.sona))
+    assert.equal(searchProducts(list, 'sona-5')[0].id, inv.sona)
+    assert.equal(searchProducts(list, inv.sona)[0].id, inv.sona)
+    assert.equal(searchProducts(list, inv.sona.slice(0, 8))[0].id, inv.sona)
+    assert.equal(exactProduct(list, 'SONA-5')?.id, inv.sona)
+    assert.equal(exactProduct(list, 'sona masoori rice 5kg')?.id, inv.sona)
+    // saved price, per bag and converted per kg
+    assert.equal(priceFor(fromBoot, 'Bag'), 320)
+    assert.equal(priceFor(fromBoot, 'Kg'), 64)
+  })
+
+  test('a sale at the saved price deducts the stock in the same transaction', async () => {
+    const p = (await call('GET', `/products/${inv.sona}`, { token: counter.token })).body
+    const r = await call('POST', '/bills', { token: counter.token, body: sale([line(p, 3, 'Bag', p.price)], { amountPaid: 1008 }) })
+    assert.equal(r.status, 201, JSON.stringify(r.body))
+    assert.equal(r.body.items[0].productId, inv.sona)
+    assert.equal(r.body.items[0].sku, 'SONA-5')
+    assert.equal(r.body.totals.grandTotal, 1008) // 3 × 320 + 5% GST
+    assert.equal(await stockOf(inv.sona), 17)
+    inv.bill = r.body.id
+    // selling by weight deducts bags through the package size: 10 kg = 2 bags of 5 kg
+    const { priceFor } = await import('../src/lib/inventory.ts')
+    const kg = await call('POST', '/bills', { token: counter.token, body: sale([line(p, 10, 'Kg', priceFor(p, 'Kg'))]) })
+    assert.equal(kg.status, 201, JSON.stringify(kg.body))
+    assert.equal(await stockOf(inv.sona), 15)
+    const moves = (await call('GET', `/inventory/movements?productId=${inv.sona}`, { token: counter.token })).body
+    assert.deepEqual(
+      moves.items.map((m: { type: string; quantity: number }) => [m.type, m.quantity]),
+      [
+        ['SALE', -2],
+        ['SALE', -3],
+        ['OPENING', 20],
+      ],
+    )
+  })
+
+  test('a sale with more than the available stock is refused and nothing is saved', async () => {
+    const p = (await call('GET', `/products/${inv.sona}`, { token: counter.token })).body
+    const next = (await call('GET', '/invoices/next', { token: counter.token })).body.invoiceNo
+    const r = await call('POST', '/bills', { token: counter.token, body: sale([line(p, 16, 'Bag', p.price)]) })
+    assert.equal(r.status, 409)
+    assert.match(r.body.error, /Not enough stock for Sona Masoori Rice 5kg: 15 Bag available, 16 Bag needed/)
+    assert.equal(await stockOf(inv.sona), 15)
+    assert.equal((await call('GET', '/invoices/next', { token: counter.token })).body.invoiceNo, next)
+    // two counters selling the last bags at the same moment: exactly one succeeds
+    const both = await Promise.all([1, 2].map(() => call('POST', '/bills', { token: counter.token, body: sale([line(p, 10, 'Bag', p.price)]) })))
+    assert.deepEqual(both.map((x) => x.status).sort(), [201, 409])
+    assert.equal(await stockOf(inv.sona), 5)
+  })
+
+  test('editing a product updates the price the bill screen uses; stock changes go through an adjustment', async () => {
+    const p = (await call('GET', `/products/${inv.sona}`, { token: manager.token })).body
+    const { id: _id, categoryName: _c, stock: _s, ...rest } = p
+    const r = await call('PUT', `/products/${inv.sona}`, { token: manager.token, body: { ...rest, price: 330, reorderLevel: 6 } })
+    assert.equal(r.status, 200, JSON.stringify(r.body))
+    assert.equal(r.body.price, 330)
+    assert.equal(r.body.stock, 5, 'editing details never changes stock')
+    assert.equal(r.body.bagWeight, 5)
+    const list = (await call('GET', '/products', { token: counter.token })).body
+    assert.equal(list.find((x: { id: string }) => x.id === inv.sona).price, 330)
+    // low-stock alert: 5 bags is at or below the minimum of 6
+    const sum = (await call('GET', '/inventory/summary', { token: counter.token })).body
+    assert.ok(sum.lowStock.some((x: { id: string }) => x.id === inv.sona))
+    // "Available stock" changed in the edit form → counted-stock adjustment with the reason
+    const a = await call('POST', '/inventory/adjustments', { token: manager.token, body: { productId: inv.sona, mode: 'set', quantity: 40, note: 'New stock received' } })
+    assert.equal(a.status, 201, JSON.stringify(a.body))
+    assert.equal(await stockOf(inv.sona), 40)
+    assert.equal((await call('POST', '/inventory/adjustments', { token: counter.token, body: { productId: inv.sona, mode: 'set', quantity: 1, note: 'x' } })).status, 403)
+  })
+
+  test('deleting: a product with sales is archived (history kept), an unused one is removed', async () => {
+    const d = await call('DELETE', `/products/${inv.sona}`, { token: manager.token })
+    assert.equal(d.status, 200)
+    assert.equal(d.body.archived, true)
+    const list = (await call('GET', '/products', { token: counter.token })).body
+    assert.ok(!list.some((x: { id: string }) => x.id === inv.sona), 'no longer offered on the bill screen')
+    const old = (await call('GET', `/bills/${inv.bill}`, { token: counter.token })).body
+    assert.equal(old.items[0].name, 'Sona Masoori Rice 5kg', 'old bills keep the line')
+    const p = (await call('GET', `/products/${inv.sona}`, { token: counter.token })).body
+    const sell = await call('POST', '/bills', { token: counter.token, body: sale([line(p, 1, 'Bag', 330)]) })
+    assert.equal(sell.status, 400)
+    assert.match(sell.body.error, /archived/)
+
+    const fresh = await call('POST', '/products', { token: manager.token, body: { name: 'Idli Rice 1kg', unit: 'Bag', bagWeight: 1, price: 60, gstRate: 5 } })
+    assert.equal(fresh.status, 201)
+    assert.equal((await call('DELETE', `/products/${fresh.body.id}`, { token: manager.token })).body.archived, false)
+    assert.equal((await call('GET', `/products/${fresh.body.id}`, { token: manager.token })).status, 404)
+  })
+})

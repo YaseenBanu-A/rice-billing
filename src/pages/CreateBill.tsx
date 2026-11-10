@@ -7,6 +7,7 @@ import {
   HandCoins,
   Landmark,
   Minus,
+  Package,
   Plus,
   Printer,
   RotateCcw,
@@ -14,6 +15,7 @@ import {
   Smartphone,
   Trash2,
   UserRound,
+  X,
   type LucideIcon,
 } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
@@ -22,9 +24,10 @@ import { FormatSwitch } from '../components/invoice/FormatSwitch'
 import { Button, Card, ConfirmDialog, EmptyState, Field, IconButton, Input, Segmented, StatusBadge, Textarea, cn } from '../components/ui'
 import { UNITS, computeTotals, paymentStatus } from '../lib/billing'
 import { currencySymbol, initials, toDateKey, uid } from '../lib/format'
+import { packLabel, priceFor, searchProducts, stockLabel, stockNeeded } from '../lib/inventory'
 import { useLocalStorage } from '../lib/useLocalStorage'
 import { useApp } from '../store/AppContext'
-import type { Bill, BillCustomer, BillInput, BillItem, DiscountType, InvoiceFormat, PaymentMethod } from '../types'
+import type { Bill, BillCustomer, BillInput, BillItem, DiscountType, InvoiceFormat, PaymentMethod, Product } from '../types'
 
 interface Draft {
   id: string
@@ -61,7 +64,7 @@ let handledNewBillRequest = 0
 
 export function CreateBill() {
   const app = useApp()
-  const { settings, customers, bills, money, toast } = app
+  const { settings, customers, bills, products, money, toast } = app
   const sym = currencySymbol(settings.currency)
 
   const blankDraft = (): Draft => ({
@@ -109,6 +112,32 @@ export function CreateBill() {
   )
   const status = paymentStatus(totals)
 
+  /* ---------- stock ---------- */
+  const productById = useMemo(() => new Map(products.map((p) => [p.id, p])), [products])
+  /**
+   * Stock this bill may use per product: what is on the shelf, plus (when editing a saved bill) what the
+   * saved copy of this bill already took, since the server only deducts the difference.
+   */
+  const savedBill = bills.find((b) => b.id === draft.id)
+  const available = (p: Product) =>
+    p.stock + (savedBill?.items.filter((i) => i.productId === p.id).reduce((s, i) => s + stockNeeded(p, i.quantity - (i.returnedQty ?? 0), i.unit), 0) ?? 0)
+  /** Stock the current lines need per product (in the product's stock unit) */
+  const needByProduct = useMemo(() => {
+    const m = new Map<string, number>()
+    for (const i of draft.items) {
+      const p = i.productId ? productById.get(i.productId) : undefined
+      if (p && Number.isFinite(i.quantity)) m.set(p.id, (m.get(p.id) ?? 0) + stockNeeded(p, i.quantity, i.unit))
+    }
+    return m
+  }, [draft.items, productById])
+  const shortOf = (productId: string) => {
+    const p = productById.get(productId)
+    if (!p || settings.allowNegativeStock) return null
+    const need = needByProduct.get(productId) ?? 0
+    const have = available(p)
+    return need > have + 1e-9 ? { p, need, have } : null
+  }
+
   /* ---------- validation ---------- */
   const itemErrors = (i: BillItem) => ({
     name: !i.name.trim() ? 'Enter the item name' : '',
@@ -133,6 +162,10 @@ export function CreateBill() {
     if (draft.items.some((i) => itemErrors(i).price)) return 'Prices cannot be empty or negative.'
     if (discountError) return discountError
     if (paidError) return paidError
+    for (const id of needByProduct.keys()) {
+      const s = shortOf(id)
+      if (s) return `Not enough stock for ${s.p.name}: ${stockLabel(Math.max(s.have, 0), s.p.unit)} available, ${stockLabel(s.need, s.p.unit)} on this bill.`
+    }
     if (draft.customer.phone && !/^[+\d][\d\s-]{6,}$/.test(draft.customer.phone.trim())) return 'Customer phone number looks invalid.'
     return null
   }
@@ -236,21 +269,41 @@ export function CreateBill() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [app.newBillRequest])
 
-  function addItem(name: string, unit: string, price: number, quantity: number, bags?: number) {
-    setDraft((d) => ({
-      ...d,
-      dirty: true,
-      items: [...d.items, { id: uid('li-'), productId: '', name, sku: '', price, quantity, unit, bags, gstRate: settings.defaultGst }],
-    }))
+  /** Stock still free for this product after the lines already on the bill (null when stock isn't limited) */
+  const freeStock = (p: Product) => (settings.allowNegativeStock ? null : available(p) - (needByProduct.get(p.id) ?? 0))
+
+  /**
+   * Adds one of the product (in its own unit, at its saved selling price) to the bill. Picking a product that is
+   * already on the bill raises that line's quantity instead of adding a second row. Returns false when out of stock.
+   */
+  function addProduct(p: Product): boolean {
+    const free = freeStock(p)
+    if (free !== null && free < 1 - 1e-9) {
+      toast(free > 0 ? `Only ${stockLabel(free, p.unit)} of ${p.name} left in stock` : `${p.name} is out of stock`, 'error')
+      return false
+    }
+    setDraft((d) => {
+      const existing = d.items.find((i) => i.productId === p.id && (i.unit || p.unit) === p.unit)
+      return {
+        ...d,
+        dirty: true,
+        items: existing
+          ? d.items.map((i) => (i.id === existing.id ? { ...i, quantity: num(i.quantity) + 1 } : i))
+          : [...d.items, { id: uid('li-'), productId: p.id, name: p.name, sku: p.sku, hsnCode: p.hsnCode, price: p.price, quantity: 1, unit: p.unit, gstRate: p.gstRate }],
+      }
+    })
+    return true
   }
 
-  // Item names billed before, with their latest rate and unit (bills are newest first)
-  const pastItems = useMemo(() => {
-    const map = new Map<string, PastItem>()
-    for (const b of bills)
-      for (const it of b.items) if (!map.has(it.name.toLowerCase())) map.set(it.name.toLowerCase(), { name: it.name, price: it.price, unit: it.unit ?? '' })
-    return map
-  }, [bills])
+  /** "+" on a bill line: refused when the product has no more stock */
+  function increaseQty(item: BillItem) {
+    const p = item.productId ? productById.get(item.productId) : undefined
+    if (p) {
+      const free = freeStock(p)
+      if (free !== null && stockNeeded(p, 1, item.unit) > free + 1e-9) return toast(`No more ${p.name} in stock (${stockLabel(Math.max(available(p), 0), p.unit)} available)`, 'error')
+    }
+    patchItem(item.id, { quantity: num(item.quantity) + 1 })
+  }
 
   // Shortcuts: "/" focus item name, Ctrl/Cmd+S save
   const saveRef = useRef(save)
@@ -293,7 +346,7 @@ export function CreateBill() {
             )}
           </div>
           <p className="mt-1 text-sm text-ink-500">
-            Type the item, bags, weight and rate, pressing Enter after each (leave Bags empty if not needed)
+            Search a product by name, SKU or ID and pick it to add it to the bill
           </p>
         </div>
         <Button icon={RotateCcw} onClick={() => (draft.items.length && draft.dirty ? setConfirmNew(true) : newBill())}>
@@ -354,11 +407,11 @@ export function CreateBill() {
                   </button>
                 )}
               </div>
-              <ItemEntry onAdd={addItem} inputRef={searchRef} pastItems={pastItems} sym={sym} />
+              <ProductSearch onPick={addProduct} inputRef={searchRef} products={products} freeStock={freeStock} money={money} />
             </div>
 
             {draft.items.length === 0 ? (
-              <EmptyState icon={ShoppingCart} title="No items added yet" description="Type an item name and its rate above to start the bill." />
+              <EmptyState icon={ShoppingCart} title="No items added yet" description="Search a product above and pick it to start the bill." />
             ) : (
               // Row layout follows the space this card actually has (container query), not the window width
               <div className="@container">
@@ -373,6 +426,8 @@ export function CreateBill() {
                 <ul className="divide-y divide-slate-100">
                   {draft.items.map((item) => {
                     const errs = showErrors || !Number.isFinite(item.quantity) || item.quantity <= 0 || item.price < 0 ? itemErrors(item) : { name: '', price: '', quantity: '' }
+                    const linked = item.productId ? productById.get(item.productId) : undefined
+                    const short = item.productId ? shortOf(item.productId) : null
                     return (
                       <li key={item.id} className="grid grid-cols-[1fr_auto] items-center gap-x-4 gap-y-3 px-5 py-3.5 transition-colors hover:bg-slate-50/50 @2xl:grid-cols-[minmax(0,1fr)_120px_136px_120px_40px]">
                         <div className="min-w-0">
@@ -386,7 +441,17 @@ export function CreateBill() {
                               errs.name ? 'border-red-400' : 'border-transparent hover:border-slate-200 focus:border-brand-500',
                             )}
                           />
-                          <div className="mt-0.5 flex items-center gap-2 text-xs text-ink-400">
+                          <div className="mt-0.5 flex flex-wrap items-center gap-x-2 gap-y-0.5 text-xs text-ink-400">
+                            {item.productId && (
+                              <span
+                                title={linked ? 'From Inventory: selling deducts its stock' : 'This product is no longer in Inventory'}
+                                className={cn('inline-flex items-center gap-1 font-medium', short ? 'text-red-600' : 'text-brand-600')}
+                              >
+                                <Package className="size-3" />
+                                {linked ? `${stockLabel(Math.max(available(linked), 0), linked.unit)} in stock` : 'Removed from inventory'}
+                              </span>
+                            )}
+                            {item.productId && <span>·</span>}
                             {item.sku && (
                               <>
                                 <span>{item.sku}</span>
@@ -396,7 +461,11 @@ export function CreateBill() {
                             <select
                               aria-label={`Unit of ${item.name}`}
                               value={item.unit ?? ''}
-                              onChange={(e) => patchItem(item.id, { unit: e.target.value || undefined })}
+                              onChange={(e) => {
+                                const unit = e.target.value || undefined
+                                // a linked product keeps its saved price, converted to the new unit (e.g. per bag → per kg)
+                                patchItem(item.id, linked && unit ? { unit, price: priceFor(linked, unit) } : { unit })
+                              }}
                               className="cursor-pointer rounded border border-transparent bg-transparent py-0 font-medium text-ink-500 hover:border-slate-200 focus:border-brand-500 focus:outline-none"
                             >
                               {!item.unit && <option value="">No unit</option>}
@@ -486,13 +555,14 @@ export function CreateBill() {
                               />
                               <button
                                 aria-label="Increase quantity"
-                                onClick={() => patchItem(item.id, { quantity: num(item.quantity) + 1 })}
+                                onClick={() => increaseQty(item)}
                                 className="flex h-full w-8 items-center justify-center text-ink-500 transition-colors hover:bg-slate-100 hover:text-ink-900"
                               >
                                 <Plus className="size-3.5" />
                               </button>
                             </div>
                             {errs.quantity && <p className="mt-1 text-center text-[11px] text-red-600">{errs.quantity}</p>}
+                            {!errs.quantity && short && <p className="mt-1 text-center text-[11px] text-red-600">Only {stockLabel(Math.max(short.have, 0), short.p.unit)} in stock</p>}
                           </div>
 
                           <div className="text-right">
@@ -816,153 +886,157 @@ function CustomerSection({ draft, patch, customers }: { draft: Draft; patch: (p:
   )
 }
 
-/* ---------------- Item entry ---------------- */
+/* ---------------- Product search ---------------- */
 
-/** Type an item name and rate, press Enter: no product list needed. Names billed before are suggested with their last rate. */
-interface PastItem {
-  name: string
-  price: number
-  unit: string
-}
-
-function ItemEntry({
-  onAdd,
+/**
+ * One search box over the Inventory products (name, SKU or product ID). Clicking a result, or pressing Enter on
+ * the highlighted one, adds it to the bill at its saved selling price; picking it again raises the quantity.
+ */
+function ProductSearch({
+  onPick,
   inputRef,
-  pastItems,
-  sym,
+  products,
+  freeStock,
+  money,
 }: {
-  onAdd: (name: string, unit: string, price: number, quantity: number, bags?: number) => void
+  /** returns false when the product could not be added (out of stock) */
+  onPick: (p: Product) => boolean
   inputRef: React.RefObject<HTMLInputElement | null>
-  pastItems: Map<string, PastItem>
-  sym: string
+  products: Product[]
+  /** stock still free for this product on this bill; null = not limited */
+  freeStock: (p: Product) => number | null
+  money: (n: number) => string
 }) {
-  const [name, setName] = useState('')
-  // kept between items: a shop usually sells several things in the same unit
-  const [unit, setUnit] = useState(UNITS[0])
-  const [rate, setRate] = useState('')
-  const [bags, setBags] = useState('')
-  const [qty, setQty] = useState('1')
-  const [error, setError] = useState('')
-  const bagsRef = useRef<HTMLInputElement>(null)
-  const qtyRef = useRef<HTMLInputElement>(null)
-  const rateRef = useRef<HTMLInputElement>(null)
+  const [q, setQ] = useState('')
+  const [open, setOpen] = useState(false)
+  const [hi, setHi] = useState(0)
+  const listRef = useRef<HTMLDivElement>(null)
 
-  function add() {
-    const price = parseFloat(rate)
-    const quantity = parseFloat(qty)
-    const bagCount = bags.trim() === '' ? undefined : parseFloat(bags)
-    if (!name.trim()) return (setError('Type the item name'), inputRef.current?.focus())
-    if (bagCount !== undefined && (!Number.isFinite(bagCount) || bagCount < 0)) return (setError('Bags must be zero or more'), bagsRef.current?.select())
-    if (!Number.isFinite(quantity) || quantity <= 0) return (setError('Quantity must be more than 0'), qtyRef.current?.select())
-    if (!Number.isFinite(price) || price < 0) return (setError('Enter the rate'), rateRef.current?.focus())
-    onAdd(name.trim(), unit, price, quantity, bagCount || undefined)
-    setName('')
-    setBags('')
-    setRate('')
-    setQty('1')
-    setError('')
+  const results = useMemo(() => (q.trim() ? searchProducts(products, q, 30) : []), [q, products])
+  const showList = open && q.trim() !== ''
+
+  function pick(p: Product) {
+    if (!onPick(p)) return
+    setQ('')
+    setHi(0)
+    setOpen(false)
     inputRef.current?.focus()
   }
 
-  const onEnter = (e: React.KeyboardEvent, fn: () => void) => {
-    if (e.key !== 'Enter') return
-    e.preventDefault()
-    fn()
+  function move(delta: number) {
+    if (!results.length) return
+    const next = Math.min(Math.max(hi + delta, 0), results.length - 1)
+    setHi(next)
+    listRef.current?.querySelectorAll('[role="option"]')[next]?.scrollIntoView({ block: 'nearest' })
   }
-  const label = 'mb-1 block text-[11px] font-medium text-ink-500'
-  const field =
-    'tabular h-11 w-full rounded-xl border border-slate-200 bg-surface text-sm text-ink-900 shadow-xs outline-none transition-colors placeholder:text-ink-400 hover:border-ink-300 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15'
 
   return (
-    <div>
-      <div className="grid grid-cols-[minmax(0,1fr)_76px_90px_90px_120px_auto] items-end gap-2 max-sm:grid-cols-4">
-        <label className="max-sm:col-span-4">
-          <span className={label}>Item</span>
-          <input
-            ref={inputRef}
-            value={name}
-            list="past-items"
-            autoComplete="off"
-            placeholder="Item name"
-            onChange={(e) => {
-              setName(e.target.value)
-              setError('')
-              const past = pastItems.get(e.target.value.trim().toLowerCase())
-              if (past && rate === '') setRate(String(past.price))
-              if (past?.unit) setUnit(past.unit)
-            }}
-            onKeyDown={(e) => onEnter(e, () => (name.trim() ? bagsRef.current?.focus() : add()))}
-            className={cn(field, 'px-3.5')}
-          />
-        </label>
-        <datalist id="past-items">
-          {[...pastItems.values()].slice(0, 200).map((p) => (
-            <option key={p.name} value={p.name} />
-          ))}
-        </datalist>
-        <label>
-          <span className={label}>Bags</span>
-          <input
-            ref={bagsRef}
-            type="number"
-            min={0}
-            step="any"
-            inputMode="decimal"
-            placeholder="–"
-            value={bags}
-            onChange={(e) => (setBags(e.target.value), setError(''))}
-            onKeyDown={(e) => onEnter(e, () => qtyRef.current?.select())}
-            className={cn(field, 'px-3 text-center')}
-          />
-        </label>
-        <label>
-          <span className={label}>{unit === 'Kg' ? 'Weight (Kg)' : 'Quantity'}</span>
-          <input
-            ref={qtyRef}
-            type="number"
-            min={0}
-            step="any"
-            inputMode="decimal"
-            placeholder="Qty"
-            value={qty}
-            onChange={(e) => (setQty(e.target.value), setError(''))}
-            onKeyDown={(e) => onEnter(e, () => (rate === '' ? rateRef.current?.focus() : add()))}
-            className={cn(field, 'px-3 text-center')}
-          />
-        </label>
-        <label>
-          <span className={label}>Unit</span>
-          <select value={unit} onChange={(e) => setUnit(e.target.value)} className={cn(field, 'cursor-pointer px-3')}>
-            {UNITS.map((u) => (
-              <option key={u} value={u}>
-                {u}
-              </option>
-            ))}
-          </select>
-        </label>
-        <label>
-          <span className={label}>{unit === 'Loose' ? 'Rate' : `Rate per ${unit}`}</span>
-          <span className="relative block">
-            <span className="pointer-events-none absolute top-1/2 left-3 -translate-y-1/2 text-sm text-ink-400">{sym}</span>
-            <input
-              ref={rateRef}
-              type="number"
-              min={0}
-              step="0.01"
-              inputMode="decimal"
-              placeholder="0.00"
-              value={rate}
-              onChange={(e) => (setRate(e.target.value), setError(''))}
-              onKeyDown={(e) => onEnter(e, add)}
-              className={cn(field, 'pr-3 pl-7 text-right')}
-            />
-          </span>
-        </label>
-        <Button variant="primary" icon={Plus} onClick={add} className="h-11 max-sm:col-span-4">
-          Add
-        </Button>
-      </div>
-      {error && <p className="mt-1.5 text-xs text-red-600">{error}</p>}
+    <div className="relative">
+      <svg className="pointer-events-none absolute top-1/2 left-3.5 size-4 -translate-y-1/2 text-ink-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+        <circle cx="11" cy="11" r="7" />
+        <path d="m20 20-3.5-3.5" />
+      </svg>
+      <input
+        ref={inputRef}
+        value={q}
+        autoComplete="off"
+        role="combobox"
+        aria-label="Search product"
+        aria-expanded={showList}
+        aria-autocomplete="list"
+        placeholder="Search product name, SKU or ID"
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 120)}
+        onChange={(e) => {
+          setQ(e.target.value)
+          setOpen(true)
+          setHi(0)
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'ArrowDown') (e.preventDefault(), setOpen(true), move(1))
+          else if (e.key === 'ArrowUp') (e.preventDefault(), move(-1))
+          else if (e.key === 'Escape') setOpen(false)
+          else if (e.key === 'Enter') {
+            e.preventDefault()
+            const p = results[hi] ?? results[0]
+            if (p) pick(p)
+          }
+        }}
+        className="h-11 w-full rounded-xl border border-slate-200 bg-surface pr-10 pl-10 text-sm text-ink-900 shadow-xs transition-colors outline-none placeholder:text-ink-400 hover:border-ink-300 focus:border-brand-500 focus:ring-4 focus:ring-brand-500/15"
+      />
+      {q && (
+        <button
+          type="button"
+          onClick={() => (setQ(''), inputRef.current?.focus())}
+          className="absolute top-1/2 right-2.5 -translate-y-1/2 rounded p-1 text-ink-400 hover:text-ink-700"
+          aria-label="Clear search"
+        >
+          <X className="size-4" />
+        </button>
+      )}
+
+      {showList && (
+        <div ref={listRef} role="listbox" className="animate-fade-in absolute z-20 mt-1.5 max-h-[min(420px,60vh)] w-full overflow-y-auto rounded-xl border border-slate-200 bg-surface py-1 shadow-pop">
+          {results.length === 0 ? (
+            <p className="px-4 py-6 text-center text-sm text-ink-500">
+              {products.length === 0 ? 'No products in Inventory yet. Add them on the Inventory page.' : `No product matches “${q.trim()}”`}
+            </p>
+          ) : (
+            results.map((p, i) => {
+              const free = freeStock(p)
+              const left = free ?? p.stock
+              const out = free !== null && free < 1 - 1e-9
+              const low = !out && p.stock <= p.reorderLevel
+              return (
+                <button
+                  key={p.id}
+                  type="button"
+                  role="option"
+                  aria-selected={i === hi}
+                  aria-disabled={out}
+                  onMouseDown={(e) => e.preventDefault()}
+                  onClick={() => pick(p)}
+                  onMouseEnter={() => setHi(i)}
+                  className={cn('flex w-full items-center gap-3 px-3 py-2.5 text-left transition-colors', i === hi && 'bg-slate-50', out && 'opacity-60')}
+                >
+                  <span className="hidden size-9 shrink-0 items-center justify-center rounded-lg bg-brand-50 text-brand-600 sm:flex">
+                    <Package className="size-4" />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-medium text-ink-900">{p.name}</span>
+                    <span className="mt-0.5 flex flex-wrap items-center gap-x-1.5 text-[11px] text-ink-400">
+                      <span className="font-mono text-ink-500" title={`Product ID ${p.id}`}>
+                        {p.sku}
+                      </span>
+                      {packLabel(p) && (
+                        <>
+                          <span>·</span>
+                          <span className="rounded bg-slate-100 px-1.5 py-px font-medium text-ink-700">{packLabel(p)}</span>
+                        </>
+                      )}
+                      {p.categoryName && (
+                        <>
+                          <span className="max-sm:hidden">·</span>
+                          <span className="max-sm:hidden">{p.categoryName}</span>
+                        </>
+                      )}
+                    </span>
+                  </span>
+                  <span className="shrink-0 text-right">
+                    <span className="tabular block text-sm font-semibold text-ink-900">
+                      {money(p.price)}
+                      <span className="text-[11px] font-normal text-ink-400"> /{p.unit}</span>
+                    </span>
+                    <span className={cn('tabular block text-[11px] font-medium', out ? 'text-red-600' : low ? 'text-amber-700' : 'text-emerald-700')}>
+                      {out ? 'Out of stock' : `${stockLabel(left, p.unit)} available`}
+                    </span>
+                  </span>
+                </button>
+              )
+            })
+          )}
+        </div>
+      )}
     </div>
   )
 }

@@ -105,6 +105,25 @@ const query = (params: Record<string, string | number | boolean | undefined>) =>
   return q ? `?${q}` : ''
 }
 
+/** What the inventory form sends. Stock is set with `openingStock` on create, and through adjustments afterwards. */
+export interface ProductInput {
+  name: string
+  sku: string
+  categoryId?: string
+  variety?: string
+  brand?: string
+  hsnCode: string
+  unit: string
+  /** package size in kg (1, 5, 10, 25 …) */
+  bagWeight?: number
+  price: number
+  purchasePrice: number
+  gstRate: number
+  reorderLevel: number
+  openingStock?: number
+  active: boolean
+}
+
 export interface Bootstrap {
   settings: Settings
   taxRates: TaxRate[]
@@ -140,6 +159,17 @@ export const api = {
   nextInvoiceNo: () => request<{ invoiceNo: string }>('GET', '/invoices/next').then((r) => r.invoiceNo),
   customers: () => request<Customer[]>('GET', '/customers'),
   products: () => request<Product[]>('GET', '/products'),
+
+  /* inventory: products are the same records the bill screen searches and sells from */
+  createProduct: (p: ProductInput) => request<Product>('POST', '/products', p),
+  updateProduct: (id: string, p: ProductInput) => request<Product>('PUT', `/products/${enc(id)}`, p),
+  /** products already used on bills or stock history are archived (hidden) instead of deleted */
+  deleteProduct: (id: string) => request<{ archived: boolean }>('DELETE', `/products/${enc(id)}`),
+  categories: () => request<Category[]>('GET', '/categories'),
+  createCategory: (name: string) => request<Category>('POST', '/categories', { name }),
+  /** mode "set" = counted stock; "add"/"remove" = a quantity in the product's unit. A reason is required. */
+  adjustStock: (a: { productId: string; mode: 'set' | 'add' | 'remove'; quantity: number; note: string }) =>
+    request<{ productId: string; stock: number; delta: number }>('POST', '/inventory/adjustments', a),
 
   /* bills */
   bills: (q: { limit?: number; offset?: number } = {}) => request<BillPage>('GET', `/bills${query({ ...q })}`),

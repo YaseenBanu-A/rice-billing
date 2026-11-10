@@ -1,9 +1,10 @@
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { api, ApiError, refreshSession, setSignedOutHandler } from '../lib/api'
+import { api, ApiError, refreshSession, setSignedOutHandler, type ProductInput } from '../lib/api'
+import { can as canRole, type Permission } from '../../shared/permissions.ts'
 import { LoginScreen } from '../components/LoginScreen'
 import { formatMoney, round2, toDateKey, uid } from '../lib/format'
 import { connectLive, disconnectLive, onLiveChange } from '../lib/live'
-import type { Bill, BillInput, Customer, InvoiceFormat, Page, Product, Settings } from '../types'
+import type { Bill, BillInput, Category, Customer, InvoiceFormat, Page, Product, Settings, TaxRate, User } from '../types'
 
 export type ToastKind = 'success' | 'error' | 'info'
 export interface Toast {
@@ -26,6 +27,20 @@ interface AppState {
 
   products: Product[]
   customers: Customer[]
+  categories: Category[]
+  taxRates: TaxRate[]
+  /** signed-in user, and what their role may do (the server checks again) */
+  user: User
+  can: (p: Permission) => boolean
+
+  /** Inventory: creates the product, or updates it when `id` is given */
+  saveProduct: (id: string | null, input: ProductInput) => Promise<Product>
+  /** Returns true when the product was archived (it has sales or stock history) instead of deleted */
+  deleteProduct: (id: string) => Promise<boolean>
+  /** Sets the counted stock of a product (recorded as a stock adjustment with the reason) */
+  setStock: (productId: string, stock: number, reason: string) => Promise<void>
+  addCategory: (name: string) => Promise<Category>
+  refreshProducts: () => Promise<void>
 
   bills: Bill[]
   /** Creates the bill, or updates it when `id` belongs to a saved bill. */
@@ -61,6 +76,9 @@ interface Data {
   settings: Settings
   products: Product[]
   customers: Customer[]
+  categories: Category[]
+  taxRates: TaxRate[]
+  user: User
   bills: Bill[]
   nextInvoiceNo: string
   authRequired: boolean
@@ -68,7 +86,7 @@ interface Data {
 
 const Ctx = createContext<AppState | null>(null)
 
-const PAGES: Page[] = ['dashboard', 'create', 'history', 'settings']
+const PAGES: Page[] = ['dashboard', 'create', 'history', 'inventory', 'settings']
 const pageFromHash = (): Page => {
   const h = window.location.hash.replace('#/', '') as Page
   return PAGES.includes(h) ? h : 'dashboard'
@@ -100,7 +118,17 @@ export function AppProvider({ children }: { children: ReactNode }) {
     setLoadError(null)
     try {
       const [boot, bills] = await Promise.all([api.bootstrap(), loadAllBills()])
-      setData({ settings: boot.settings, products: boot.products, customers: boot.customers, bills, nextInvoiceNo: boot.nextInvoiceNo, authRequired: true })
+      setData({
+        settings: boot.settings,
+        products: boot.products,
+        customers: boot.customers,
+        categories: boot.categories,
+        taxRates: boot.taxRates,
+        user: boot.user,
+        bills,
+        nextInvoiceNo: boot.nextInvoiceNo,
+        authRequired: true,
+      })
       setNeedsLogin(false)
       connectLive()
     } catch (err) {
@@ -157,6 +185,14 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, [patch])
 
+  const refreshProducts = useCallback(async () => {
+    try {
+      patch({ products: await api.products() })
+    } catch {
+      // non-critical: live updates reload products too
+    }
+  }, [patch])
+
   // Multi-user: when anyone creates, edits or pays a bill (or changes customers/settings), reload that data
   const signedIn = !!data
   const reloading = useRef<Record<string, ReturnType<typeof setTimeout>>>({})
@@ -174,7 +210,12 @@ export function AppProvider({ children }: { children: ReactNode }) {
       }
       if (all || ev.entity === 'customer' || ev.entity === 'invoice') later('customers', async () => patch({ customers: await api.customers() }))
       if (all || ev.entity === 'product' || ev.entity === 'stock') later('products', async () => patch({ products: await api.products() }))
-      if (all || ev.entity === 'settings') later('settings', async () => patch({ settings: (await api.bootstrap()).settings }))
+      if (all || ev.entity === 'category' || ev.entity === 'product') later('categories', async () => patch({ categories: await api.categories() }))
+      if (all || ev.entity === 'settings')
+        later('settings', async () => {
+          const b = await api.bootstrap()
+          patch({ settings: b.settings, taxRates: b.taxRates })
+        })
     })
     return () => {
       off()
@@ -205,12 +246,38 @@ export function AppProvider({ children }: { children: ReactNode }) {
       },
       products: data.products,
       customers: data.customers,
+      categories: data.categories,
+      taxRates: data.taxRates,
+      user: data.user,
+      can: (p) => canRole(data.user.role, p),
+      saveProduct: async (id, input) => {
+        const saved = id ? await api.updateProduct(id, input) : await api.createProduct(input)
+        patch((d) => ({ products: [...d.products.filter((p) => p.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)) }))
+        return saved
+      },
+      deleteProduct: async (id) => {
+        const r = await api.deleteProduct(id)
+        patch((d) => ({ products: d.products.filter((p) => p.id !== id) }))
+        return r.archived
+      },
+      setStock: async (productId, stock, reason) => {
+        await api.adjustStock({ productId, mode: 'set', quantity: stock, note: reason })
+        await refreshProducts()
+      },
+      addCategory: async (name) => {
+        const c = await api.createCategory(name)
+        patch((d) => ({ categories: [...d.categories, c].sort((a, b) => a.name.localeCompare(b.name)) }))
+        return c
+      },
+      refreshProducts,
       bills: data.bills,
       saveBill: async (id, input) => {
         const exists = id !== null && data.bills.some((b) => b.id === id)
         const bill = exists ? await api.updateBill(id, input) : await api.createBill(input)
         upsertBill(bill)
         if (!exists) refreshNextInvoice()
+        // stock changed on the server: show the new figures at once (live updates also do this)
+        if (input.items.some((i) => i.productId)) refreshProducts()
         // a new customer may have been created from the bill
         if (input.saveCustomer && !input.customer.id) api.customers().then((customers) => patch({ customers }), () => {})
         return bill
@@ -265,7 +332,7 @@ export function AppProvider({ children }: { children: ReactNode }) {
         window.location.reload()
       },
     }
-  }, [data, page, navigate, newBillRequest, createOpened, patch, refreshNextInvoice, toasts, toast, dismissToast, printJob])
+  }, [data, page, navigate, newBillRequest, createOpened, patch, refreshNextInvoice, refreshProducts, toasts, toast, dismissToast, printJob])
 
   if (needsLogin) return <LoginScreen onSignedIn={load} />
   if (!value) return <StartupScreen error={loadError} onRetry={load} />

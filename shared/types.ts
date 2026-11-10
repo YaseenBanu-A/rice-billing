@@ -190,7 +190,7 @@ export interface TaxRate {
 /** a4: full-page tax invoice · thermal: 80mm receipt · a5: half-page bill */
 export type InvoiceFormat = 'a4' | 'thermal' | 'a5'
 
-export type Page = 'dashboard' | 'create' | 'history' | 'settings'
+export type Page = 'dashboard' | 'create' | 'history' | 'inventory' | 'settings'
 
 /* ---------- purchases ---------- */
 
