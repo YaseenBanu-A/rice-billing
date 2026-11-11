@@ -419,21 +419,54 @@ model PurchaseItem {
 
 /* ---------------- expenses ---------------- */
 
+/// Expense heads (Rent, Electricity, …). Managed from the Expenses screen. A category used by expenses is
+/// archived (active = false) instead of deleted, so old expenses keep it.
+model ExpenseCategory {
+  id        String    @id @default(uuid()) @db.Uuid
+  name      String    @unique
+  active    Boolean   @default(true)
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  expenses  Expense[]
+}
+
 model Expense {
-  id              String   @id @default(uuid()) @db.Uuid
+  id              String           @id @default(uuid()) @db.Uuid
   date            DateTime
   dateKey         String
+  /// short name, e.g. "Shop rent for May"
+  title           String           @default("")
+  categoryId      String?          @db.Uuid
+  categoryRef     ExpenseCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+  /// copy of the category name (kept in step on rename), so history never depends on the category row
   category        String
-  description     String   @default("")
-  amount          Decimal  @db.Decimal(14, 2)
+  /// description / notes
+  description     String           @default("")
+  amount          Decimal          @db.Decimal(14, 2)
   paymentMethod   String
   reference       String?
-  clientRequestId String?  @unique
-  userId          String?  @db.Uuid
-  user            User?    @relation(fields: [userId], references: [id], onDelete: SetNull)
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+  clientRequestId String?          @unique
+  userId          String?          @db.Uuid
+  user            User?            @relation(fields: [userId], references: [id], onDelete: SetNull)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+
+  attachment ExpenseAttachment?
 
   @@index([dateKey])
   @@index([category])
+  @@index([categoryId])
+}
+
+/// Receipt or bill photo / PDF for an expense. Stored in the database because the web server's disk is
+/// temporary on Render (files there are lost on every deploy).
+model ExpenseAttachment {
+  id        String   @id @default(uuid()) @db.Uuid
+  expenseId String   @unique @db.Uuid
+  expense   Expense  @relation(fields: [expenseId], references: [id], onDelete: Cascade)
+  fileName  String
+  mimeType  String
+  size      Int
+  data      Bytes
+  createdAt DateTime @default(now())
 }

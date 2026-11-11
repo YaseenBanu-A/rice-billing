@@ -86,7 +86,7 @@ interface Data {
 
 const Ctx = createContext<AppState | null>(null)
 
-const PAGES: Page[] = ['dashboard', 'create', 'history', 'inventory', 'settings']
+const PAGES: Page[] = ['dashboard', 'create', 'history', 'inventory', 'expenses', 'reports', 'settings']
 const pageFromHash = (): Page => {
   const h = window.location.hash.replace('#/', '') as Page
   return PAGES.includes(h) ? h : 'dashboard'

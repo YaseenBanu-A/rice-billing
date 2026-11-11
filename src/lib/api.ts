@@ -1,4 +1,29 @@
-import type { ApiErrorBody, Backup, Bill, BillInput, BillPage, Category, Customer, PaymentInput, Product, Settings, TaxRate, User } from '../types'
+import type {
+  ApiErrorBody,
+  Backup,
+  Bill,
+  BillInput,
+  BillPage,
+  Category,
+  Customer,
+  CustomerReportRow,
+  Expense,
+  ExpenseAttachmentInfo,
+  ExpenseCategory,
+  ExpenseInput,
+  ExpensePage,
+  ExpenseSummary,
+  InvoiceReportRow,
+  OutstandingRow,
+  PaymentInput,
+  PaymentReportRow,
+  Product,
+  ReportRows,
+  ReportSummary,
+  Settings,
+  TaxRate,
+  User,
+} from '../types'
 
 /*
  * Talks to the billing server. The short-lived access token lives only in memory (never in localStorage);
@@ -62,17 +87,27 @@ export function refreshSession(): Promise<Session | null> {
   return refreshing
 }
 
-async function send(method: string, path: string, body?: unknown): Promise<Response> {
-  const headers: Record<string, string> = { 'X-Requested-With': 'ajrice' }
-  if (body !== undefined) headers['Content-Type'] = 'application/json'
-  if (accessToken) headers.Authorization = `Bearer ${accessToken}`
-  return fetch(`${API_BASE}/api${path}`, { method, headers, credentials: 'include', body: body === undefined ? undefined : JSON.stringify(body) })
+/** A file sent as-is (not JSON), e.g. an expense receipt */
+interface RawBody {
+  file: Blob
+  type: string
+  name: string
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function send(method: string, path: string, body?: unknown, raw?: RawBody): Promise<Response> {
+  const headers: Record<string, string> = { 'X-Requested-With': 'ajrice' }
+  if (raw) {
+    headers['Content-Type'] = raw.type
+    headers['X-File-Name'] = encodeURIComponent(raw.name)
+  } else if (body !== undefined) headers['Content-Type'] = 'application/json'
+  if (accessToken) headers.Authorization = `Bearer ${accessToken}`
+  return fetch(`${API_BASE}/api${path}`, { method, headers, credentials: 'include', body: raw ? raw.file : body === undefined ? undefined : JSON.stringify(body) })
+}
+
+async function request<T>(method: string, path: string, body?: unknown, opts: { raw?: RawBody; blob?: boolean } = {}): Promise<T> {
   let res: Response
   try {
-    res = await send(method, path, body)
+    res = await send(method, path, body, opts.raw)
     if (res.status === 401 && !path.startsWith('/auth/')) {
       const s = await refreshSession()
       if (!s) {
@@ -80,13 +115,14 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
         onSignedOut?.()
         throw new ApiError(401, 'Please sign in again')
       }
-      res = await send(method, path, body)
+      res = await send(method, path, body, opts.raw)
     }
   } catch (e) {
     if (e instanceof ApiError) throw e
     throw new ApiError(0, 'Cannot reach the billing server. Check your internet connection.')
   }
   if (res.status === 204) return undefined as T
+  if (opts.blob && res.ok) return (await res.blob()) as T
   const data = await res.json().catch(() => null)
   if (!res.ok) {
     const err = data as ApiErrorBody | null
@@ -178,6 +214,30 @@ export const api = {
   updateBill: (id: string, input: BillInput) => request<Bill>('PUT', `/bills/${enc(id)}`, input),
   addPayment: (id: string, p: PaymentInput) => request<Bill>('POST', `/bills/${enc(id)}/payments`, p),
   deleteBill: (id: string) => request<void>('DELETE', `/bills/${enc(id)}`),
+
+  /* expenses */
+  expenses: (q: { q?: string; categoryId?: string; method?: string; from?: string; to?: string; limit?: number; offset?: number } = {}) =>
+    request<ExpensePage>('GET', `/expenses${query(q)}`),
+  expenseSummary: (from: string, to: string) => request<ExpenseSummary>('GET', `/expenses/summary${query({ from, to })}`),
+  createExpense: (e: ExpenseInput) => request<Expense>('POST', '/expenses', e),
+  updateExpense: (id: string, e: ExpenseInput) => request<Expense>('PUT', `/expenses/${enc(id)}`, e),
+  deleteExpense: (id: string) => request<void>('DELETE', `/expenses/${enc(id)}`),
+  uploadReceipt: (id: string, file: Blob, name: string) =>
+    request<ExpenseAttachmentInfo>('PUT', `/expenses/${enc(id)}/attachment`, undefined, { raw: { file, type: file.type, name } }),
+  receipt: (id: string) => request<Blob>('GET', `/expenses/${enc(id)}/attachment`, undefined, { blob: true }),
+  deleteReceipt: (id: string) => request<void>('DELETE', `/expenses/${enc(id)}/attachment`),
+  expenseCategories: () => request<ExpenseCategory[]>('GET', '/expense-categories'),
+  createExpenseCategory: (name: string) => request<ExpenseCategory>('POST', '/expense-categories', { name }),
+  updateExpenseCategory: (id: string, c: { name: string; active: boolean }) => request<ExpenseCategory>('PUT', `/expense-categories/${enc(id)}`, c),
+  /** a category with expenses is archived (hidden from new entries) instead of deleted */
+  deleteExpenseCategory: (id: string) => request<{ archived: boolean }>('DELETE', `/expense-categories/${enc(id)}`),
+
+  /* reports: every figure comes from the database; `from`/`to` are yyyy-mm-dd, inclusive */
+  reportSummary: (from: string, to: string) => request<ReportSummary>('GET', `/reports/summary${query({ from, to })}`),
+  invoiceReport: (from: string, to: string) => request<ReportRows<InvoiceReportRow>>('GET', `/reports/invoices${query({ from, to })}`),
+  customerReport: (from: string, to: string) => request<ReportRows<CustomerReportRow>>('GET', `/reports/customers${query({ from, to })}`),
+  paymentReport: (from: string, to: string) => request<ReportRows<PaymentReportRow>>('GET', `/reports/payments${query({ from, to })}`),
+  outstandingReport: () => request<ReportRows<OutstandingRow>>('GET', '/reports/outstanding'),
 
   /* backup & reset */
   backup: () => request<Backup>('GET', '/backup'),

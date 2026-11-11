@@ -5,6 +5,7 @@ import { audit, type Actor } from '../../lib/audit.ts'
 import { badRequest } from '../../lib/errors.ts'
 import { n, round2, toDateKey } from '../../lib/num.ts'
 import { asObject, isoDate, number, phoneDigits, text } from '../../lib/validate.ts'
+import { linkExpenseCategories } from '../expenses/service.ts'
 import { syncInvoice } from '../invoices/service.ts'
 
 /*
@@ -27,9 +28,17 @@ const TABLES = [
   'purchaseItem',
   'payment',
   'stockMovement',
+  'expenseCategory',
   'expense',
+  'expenseAttachment',
 ] as const
 type Table = (typeof TABLES)[number]
+
+/** Tables added after the first backup format: a backup made before them simply doesn't have them. */
+const ADDED_LATER = new Set<Table>(['expenseCategory', 'expenseAttachment'])
+
+/** Rows per insert; receipts are large, so fewer at a time */
+const batchSize = (t: Table) => (t === 'expenseAttachment' ? 20 : 1000)
 
 /** columns that point at a user; cleared on restore if that user doesn't exist here */
 const USER_REFS = ['createdById', 'userId']
@@ -41,13 +50,18 @@ const plain = (rows: unknown[]) => JSON.parse(JSON.stringify(rows, (_k, v) => (t
 
 export async function exportAll(): Promise<Backup> {
   const tables: Record<string, unknown[]> = {}
-  for (const t of TABLES) tables[t] = plain(await model(prisma, t).findMany())
+  for (const t of TABLES) {
+    const rows = await model(prisma, t).findMany()
+    // receipt files travel as base64 text inside the JSON backup
+    tables[t] = t === 'expenseAttachment' ? plain((rows as { data: Uint8Array }[]).map((r) => ({ ...r, data: Buffer.from(r.data).toString('base64') }))) : plain(rows)
+  }
   return { app: 'aj-rice-billing', version: 2, exportedAt: new Date().toISOString(), tables }
 }
 
-async function wipe(tx: Tx, keepSettings: boolean) {
+async function wipe(tx: Tx, keepSettings: boolean, keep: Set<Table> = new Set()) {
   for (const t of [...TABLES].reverse()) {
-    if (keepSettings && (t === 'companySettings' || t === 'taxRate')) continue
+    if (keepSettings && (t === 'companySettings' || t === 'taxRate' || t === 'expenseCategory')) continue
+    if (keep.has(t)) continue
     await model(tx, t).deleteMany()
   }
 }
@@ -60,22 +74,31 @@ export async function restore(raw: unknown, actor: Actor) {
   if (b.app === 'simple-billing' && b.version === 1) return importLegacy(b, actor)
   if (b.app !== 'aj-rice-billing' || b.version !== 2) throw badRequest('This is not a billing backup file')
   const tables = asObject(b.tables, 'Backup tables')
-  for (const t of TABLES) if (!Array.isArray(tables[t])) throw badRequest(`Backup file is damaged: "${t}" is missing`)
+  for (const t of TABLES) if (!Array.isArray(tables[t]) && !ADDED_LATER.has(t)) throw badRequest(`Backup file is damaged: "${t}" is missing`)
+  // a backup from before expense categories existed: keep this shop's categories and link the expenses to them
+  const keep = new Set<Table>(Array.isArray(tables.expenseCategory) ? [] : ['expenseCategory'])
 
   const userIds = new Set((await prisma.user.findMany({ select: { id: true } })).map((u) => u.id))
   return longTx(async (tx) => {
-    await wipe(tx, false)
+    await wipe(tx, false, keep)
     const counts: Record<string, number> = {}
     for (const t of TABLES) {
-      const rows = (tables[t] as Record<string, unknown>[]).map((r) => {
+      if (keep.has(t)) continue
+      const rows = ((tables[t] ?? []) as Record<string, unknown>[]).map((r) => {
         const row = { ...r }
         for (const k of USER_REFS) if (k in row && row[k] && !userIds.has(row[k] as string)) row[k] = null
         if (t === 'stockMovement') delete row.id // auto-numbered
+        if (t === 'expenseAttachment') {
+          if (typeof row.data !== 'string') throw badRequest('Backup file is damaged: a receipt file is unreadable')
+          row.data = new Uint8Array(Buffer.from(row.data, 'base64'))
+        }
         return row
       })
-      for (let i = 0; i < rows.length; i += 1000) await model(tx, t).createMany({ data: rows.slice(i, i + 1000) })
+      const size = batchSize(t)
+      for (let i = 0; i < rows.length; i += size) await model(tx, t).createMany({ data: rows.slice(i, i + size) })
       counts[t] = rows.length
     }
+    await linkExpenseCategories(tx)
     await audit(tx, actor, 'data.restore', 'backup', undefined, { exportedAt: b.exportedAt, counts })
     return { bills: counts.invoice, customers: counts.customer }
   })
@@ -157,7 +180,7 @@ async function importLegacy(b: Record<string, unknown>, actor: Actor) {
   })
 }
 
-/** Deletes all business data. Users, company settings and tax rates are kept. */
+/** Deletes all business data. Users, company settings, tax rates and expense categories are kept. */
 export async function resetAll(actor: Actor) {
   await longTx(async (tx) => {
     await wipe(tx, true)

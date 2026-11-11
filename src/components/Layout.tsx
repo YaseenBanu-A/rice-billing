@@ -1,4 +1,5 @@
-import { CalendarDays, History, LayoutDashboard, LogOut, Menu, Package, Plus, ReceiptText, Settings as SettingsIcon, X, type LucideIcon } from 'lucide-react'
+import { CalendarDays, ChartColumn, History, LayoutDashboard, LogOut, Menu, Package, Plus, ReceiptText, Settings as SettingsIcon, Wallet, X, type LucideIcon } from 'lucide-react'
+import type { Permission } from '../../shared/permissions.ts'
 import { useState, type ReactNode } from 'react'
 import { DEMO } from '../lib/api'
 import { formatMoney } from '../lib/format'
@@ -11,11 +12,14 @@ import { BusinessMark } from './BusinessMark'
 import { ThemeIconToggle, ThemeToggle } from './ThemeToggle'
 import { cn } from './ui'
 
-const NAV: { page: Page; label: string; icon: LucideIcon; hint?: string }[] = [
+const NAV: { page: Page; label: string; icon: LucideIcon; hint?: string; perm?: Permission }[] = [
   { page: 'dashboard', label: 'Dashboard', icon: LayoutDashboard },
   { page: 'create', label: 'Create Bill', icon: ReceiptText, hint: 'N' },
   { page: 'history', label: 'Bills History', icon: History },
   { page: 'inventory', label: 'Inventory', icon: Package },
+  // shown only to roles that may use them (managers and administrators); the server checks again
+  { page: 'expenses', label: 'Expenses', icon: Wallet, perm: 'expenses.view' },
+  { page: 'reports', label: 'Reports', icon: ChartColumn, perm: 'reports.view' },
   { page: 'settings', label: 'Settings', icon: SettingsIcon },
 ]
 
@@ -24,15 +28,17 @@ const TITLES: Record<Page, string> = {
   create: 'Create Bill',
   history: 'Bills History',
   inventory: 'Inventory',
+  expenses: 'Expenses',
+  reports: 'Reports',
   settings: 'Settings',
 }
 
 function NavList({ onNavigate }: { onNavigate?: () => void }) {
-  const { page, navigate, products } = useApp()
+  const { page, navigate, products, can } = useApp()
   const lowStock = products.filter((p) => p.stock <= p.reorderLevel).length
   return (
     <nav className="flex flex-col gap-1">
-      {NAV.map(({ page: p, label, icon: Icon, hint }) => {
+      {NAV.filter((n) => !n.perm || can(n.perm)).map(({ page: p, label, icon: Icon, hint }) => {
         const active = page === p
         return (
           <button

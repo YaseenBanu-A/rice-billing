@@ -1,5 +1,5 @@
 import type { Request } from 'express'
-import { badRequest } from './errors.ts'
+import { badRequest, HttpError } from './errors.ts'
 import { DATE_RE } from './validate.ts'
 
 /** A query-string value, if given once as text. */
@@ -26,4 +26,13 @@ export const param = (req: Request, key: string) => String(req.params[key] ?? ''
 export function dateKeyWhere(from?: string, to?: string) {
   if (!from && !to) return undefined
   return { ...(from ? { gte: from } : {}), ...(to ? { lte: to } : {}) }
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** A record id from the URL; anything that isn't an id is simply "not found" (instead of a database error). */
+export function idParam(req: Request, key = 'id', what = 'Record'): string {
+  const v = param(req, key)
+  if (!UUID_RE.test(v)) throw new HttpError(404, `${what} not found`)
+  return v
 }

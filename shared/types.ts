@@ -190,7 +190,7 @@ export interface TaxRate {
 /** a4: full-page tax invoice · thermal: 80mm receipt · a5: half-page bill */
 export type InvoiceFormat = 'a4' | 'thermal' | 'a5'
 
-export type Page = 'dashboard' | 'create' | 'history' | 'inventory' | 'settings'
+export type Page = 'dashboard' | 'create' | 'history' | 'inventory' | 'expenses' | 'reports' | 'settings'
 
 /* ---------- purchases ---------- */
 
@@ -260,26 +260,67 @@ export interface StockMovement {
   createdAt: string
 }
 
+export interface ExpenseAttachmentInfo {
+  fileName: string
+  mimeType: string
+  /** bytes */
+  size: number
+}
+
 export interface Expense {
   id: string
   date: string
+  dateKey: string
+  title: string
+  categoryId?: string
   category: string
+  /** description / notes */
   description: string
   amount: number
   paymentMethod: PayMethod
   reference?: string
+  attachment?: ExpenseAttachmentInfo
   userName?: string
   createdAt: string
+  updatedAt?: string
 }
 
 export interface ExpenseInput {
   date: string
+  title?: string
+  /** either the category's id or its name (a new name creates the category) */
+  categoryId?: string
   category: string
   description: string
   amount: number
   paymentMethod: PayMethod
   reference?: string
   clientRequestId?: string
+}
+
+export interface ExpenseCategory {
+  id: string
+  name: string
+  active: boolean
+  /** number of expenses filed under it */
+  expenseCount: number
+  total: number
+}
+
+export interface ExpensePage extends Paged<Expense> {
+  /** sum of every expense matching the filters, not just this page */
+  sum: number
+}
+
+export interface ExpenseSummary {
+  from: string
+  to: string
+  today: { total: number; count: number }
+  month: { total: number; count: number }
+  period: { total: number; count: number; average: number }
+  byCategory: { category: string; total: number; count: number }[]
+  byMethod: { method: string; total: number; count: number }[]
+  daily: { date: string; total: number; count: number }[]
 }
 
 /* ---------- API payloads ---------- */
@@ -361,16 +402,116 @@ export interface DashboardStats {
 export interface ReportSummary {
   from: string
   to: string
-  sales: { count: number; cancelled: number; subtotal: number; discount: number; taxable: number; gst: number; grandTotal: number; returns: number; net: number }
+  sales: {
+    count: number
+    cancelled: number
+    subtotal: number
+    discount: number
+    taxable: number
+    gst: number
+    grandTotal: number
+    returns: number
+    net: number
+    /** taxable value and GST of goods returned in the period */
+    returnsTaxable: number
+    returnsGst: number
+    /** taxable − returnsTaxable */
+    netTaxable: number
+    /** gst − returnsGst */
+    netGst: number
+  }
   gstByRate: { rate: number; taxable: number; gst: number }[]
   collections: { method: string; amount: number }[]
+  /** money received for bills in the period: payments in, refunds out (refunds are negative entries) */
+  collectionTotals: { received: number; refunded: number; net: number; count: number }
   purchases: { count: number; taxable: number; gst: number; grandTotal: number }
   supplierPayments: number
   expenses: { category: string; amount: number }[]
   expenseTotal: number
-  daily: { date: string; sales: number; collected: number; expenses: number }[]
+  expenseCount: number
+  /** Net sales excluding GST − expenses. Purchases / cost of goods are not deducted. */
+  profit: { netSales: number; gstOnNetSales: number; netSalesExGst: number; expenses: number; net: number }
+  /** unpaid balance on all bills right now (not limited to the period) */
+  outstanding: { total: number; count: number }
+  daily: { date: string; bills: number; gross: number; discount: number; returns: number; gst: number; sales: number; collected: number; expenses: number }[]
   topProducts: { name: string; quantity: number; unit: string; amount: number }[]
   receivables: { id: string; invoiceNo: string; date: string; customer: string; phone: string; grandTotal: number; balance: number }[]
+}
+
+export interface InvoiceReportRow {
+  id: string
+  invoiceNo: string
+  date: string
+  dateKey: string
+  customer: string
+  phone: string
+  items: number
+  subtotal: number
+  discount: number
+  taxable: number
+  gst: number
+  grandTotal: number
+  /** goods returned against this bill so far */
+  returns: number
+  paid: number
+  balance: number
+  status: PaymentStatus
+  method: string
+  cancelled: boolean
+  createdBy?: string
+}
+
+export interface CustomerReportRow {
+  key: string
+  customerId?: string
+  name: string
+  phone: string
+  bills: number
+  gross: number
+  returns: number
+  net: number
+  paid: number
+  balance: number
+  lastBill: string
+}
+
+export interface PaymentReportRow {
+  id: string
+  date: string
+  dateKey: string
+  invoiceId: string
+  invoiceNo: string
+  customer: string
+  kind: 'PAYMENT' | 'REFUND'
+  method: string
+  /** negative for refunds */
+  amount: number
+  reference?: string
+  note?: string
+  userName?: string
+}
+
+export interface OutstandingRow {
+  id: string
+  invoiceNo: string
+  date: string
+  dateKey: string
+  customer: string
+  phone: string
+  grandTotal: number
+  returns: number
+  paid: number
+  balance: number
+  /** days since the bill date */
+  days: number
+}
+
+export interface ReportRows<T> {
+  from: string
+  to: string
+  rows: T[]
+  /** true when the period had more rows than the report returns */
+  truncated: boolean
 }
 
 /** Everything in the shop's database except passwords, as downloaded from Settings → Backup. */
