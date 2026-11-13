@@ -1,6 +1,7 @@
 import { Eye, FileDown, Plus, Printer, ReceiptText, SearchX } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { BillViewModal } from '../components/BillViewModal'
+import { SyncChip } from '../components/SyncStatus'
 import { Avatar, Button, Card, EmptyState, IconButton, Input, PageHeader, Pill, SearchInput, Segmented, Select, StatusBadge, cn, td, th } from '../components/ui'
 import { formatDate, formatTime, toDateKey } from '../lib/format'
 import { useApp } from '../store/AppContext'
@@ -143,6 +144,9 @@ export function BillsHistory() {
                       <button onClick={() => setViewingId(b.id)} className="font-medium text-ink-900 hover:text-brand-700">
                         {b.invoiceNo}
                       </button>
+                      <div>
+                        <SyncChip id={b.id} />
+                      </div>
                     </td>
                     <td className={td}>
                       <p className="text-ink-900">{formatDate(b.date)}</p>

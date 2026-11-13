@@ -6,6 +6,8 @@ export interface Actor {
   id: string
   name: string
   ip?: string
+  /** an offline change sent by someone other than its (verified) creator: who sent it */
+  syncedBy?: { id: string; name: string }
 }
 
 export const actorOf = (req: Request): Actor => ({ id: req.user!.id, name: req.user!.name, ip: req.ip })
@@ -18,7 +20,7 @@ export async function audit(db: Tx, actor: Actor | null, action: string, entity:
       action,
       entity,
       entityId: entityId ?? null,
-      details: details ? (JSON.parse(JSON.stringify(details)) as object) : undefined,
+      details: details || actor?.syncedBy ? (JSON.parse(JSON.stringify({ ...details, ...(actor?.syncedBy ? { syncedBy: actor.syncedBy } : {}) })) as object) : undefined,
       ip: actor?.ip ?? null,
     },
   })

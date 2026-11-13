@@ -16,7 +16,8 @@ export const securityHeaders = helmet({
       styleSrc: ["'self'", "'unsafe-inline'", 'https://fonts.googleapis.com'],
       fontSrc: ["'self'", 'https://fonts.gstatic.com', 'data:'],
       imgSrc: ["'self'", 'data:', 'blob:'],
-      connectSrc: ["'self'", ...config.corsOrigins],
+      // Google Fonts: the offline service worker fetches and keeps the font files itself
+      connectSrc: ["'self'", 'https://fonts.googleapis.com', 'https://fonts.gstatic.com', ...config.corsOrigins],
       objectSrc: ["'none'"],
       frameAncestors: ["'none'"],
       upgradeInsecureRequests: config.secureCookies ? [] : null,

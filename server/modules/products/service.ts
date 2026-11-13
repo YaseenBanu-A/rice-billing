@@ -6,7 +6,7 @@ import { conflict, notFound } from '../../lib/errors.ts'
 import { formatNo } from '../../lib/numbering.ts'
 import { n, nOpt, nul, opt, round2, round3 } from '../../lib/num.ts'
 import { changeStock } from '../../lib/stock.ts'
-import { asObject, fail, number, optNumber, text } from '../../lib/validate.ts'
+import { asObject, clientId, fail, number, optNumber, text } from '../../lib/validate.ts'
 import { activeRates, assertRate } from '../settings/service.ts'
 
 const include = { category: { select: { name: true } } } as const
@@ -118,8 +118,28 @@ export async function getProduct(id: string) {
   return toProduct(r)
 }
 
-export function createProduct(raw: unknown, actor: Actor) {
+/**
+ * `id` (optional, UUID) is chosen by the offline app so bills made offline can refer to the product before it
+ * is synced. Resending a product that already exists with that id returns it unchanged (`created: false`).
+ */
+export async function createProduct(raw: unknown, actor: Actor): Promise<{ product: Product; created: boolean }> {
   const p = validate(raw)
+  const id = clientId(asObject(raw).id)
+  if (id) {
+    const existing = await prisma.product.findUnique({ where: { id }, include })
+    if (existing) return { product: toProduct(existing), created: false }
+  }
+  try {
+    return { product: await insertProduct(p, actor, id), created: true }
+  } catch (e) {
+    // the same product sent twice at the same moment: return the one that was saved
+    const existing = id && (e as { code?: string })?.code === 'P2002' ? await prisma.product.findUnique({ where: { id }, include }) : null
+    if (existing) return { product: toProduct(existing), created: false }
+    throw e
+  }
+}
+
+function insertProduct(p: ProductData, actor: Actor, id?: string) {
   return transaction(async (tx) => {
     if (!p.sku) {
       // short automatic code when none is given: P-001, P-002, ...
@@ -129,7 +149,7 @@ export function createProduct(raw: unknown, actor: Actor) {
       p.sku = formatNo('P-', seq)
     }
     await checkRefs(tx, p)
-    const r = await tx.product.create({ data: dataOf(p) })
+    const r = await tx.product.create({ data: { ...(id ? { id } : {}), ...dataOf(p) } })
     if (p.openingStock > 0) await changeStock(tx, { productId: r.id, delta: p.openingStock, type: 'OPENING', note: 'Opening stock', userId: actor.id }, true)
     await audit(tx, actor, 'product.create', 'product', r.id, { name: p.name, sku: p.sku, price: p.price, openingStock: p.openingStock })
     return toProduct((await tx.product.findUniqueOrThrow({ where: { id: r.id }, include }))!)

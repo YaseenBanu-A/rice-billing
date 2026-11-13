@@ -62,6 +62,17 @@ export function requestKey(v: unknown): string | undefined {
   return /^[A-Za-z0-9-]{8,64}$/.test(k) ? k : undefined
 }
 
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * Record id chosen by the client (offline app): a UUID, or undefined. Lets a bill or product made offline keep
+ * the same id after it is synced, so later edits and payments queued against it find it.
+ */
+export function clientId(v: unknown): string | undefined {
+  const k = text(v, 36).toLowerCase()
+  return UUID_RE.test(k) ? k : undefined
+}
+
 export function oneOf<T extends string>(v: unknown, list: readonly T[], label: string): T {
   if (!list.includes(v as T)) throw badRequest(`${label} must be one of ${list.join(', ')}`, { [label]: 'Invalid value' })
   return v as T

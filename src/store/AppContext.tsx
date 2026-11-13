@@ -1,10 +1,17 @@
+import { liveQuery } from 'dexie'
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { api, ApiError, refreshSession, setSignedOutHandler, type ProductInput } from '../lib/api'
+import { api, ApiError, isNetworkError, refreshFailedOffline, refreshSession, setSignedOutHandler, type ProductInput } from '../lib/api'
+import { round3 } from '../../shared/billing.ts'
 import { can as canRole, type Permission } from '../../shared/permissions.ts'
 import { LoginScreen } from '../components/LoginScreen'
 import { formatMoney, round2, toDateKey, uid } from '../lib/format'
 import { connectLive, disconnectLive, onLiveChange } from '../lib/live'
-import type { Bill, BillInput, Category, Customer, InvoiceFormat, Page, Product, Settings, TaxRate, User } from '../types'
+import { isOnline, onReconnect, reportNetworkError, useConnectionState, useOnline, type ConnectionState } from '../offline/connection'
+import { clearSnapshot, db, loadAttribution, loadSnapshot, saveAttribution, saveSnapshot, type OutboxOp } from '../offline/db'
+import { assertEditable, LOCAL_VERSION, stockUsed } from '../offline/localBill'
+import { discardOp, queueBillCreate, queueBillUpdate, queuePayment, queueProductCreate, queueProductUpdate, retryOp } from '../offline/outbox'
+import { requestSync, setSyncHandlers, syncNow } from '../offline/sync'
+import type { Bill, BillInput, Category, Customer, InvoiceFormat, Page, PaymentInput, Product, Settings, TaxRate, User } from '../types'
 
 export type ToastKind = 'success' | 'error' | 'info'
 export interface Toast {
@@ -70,6 +77,31 @@ interface AppState {
   /** True when the server is protected by a password (shows Sign out) */
   authRequired: boolean
   logout: () => Promise<void>
+
+  /* ---------- offline ---------- */
+  /** the billing server can be reached right now */
+  online: boolean
+  /** online, waking (server starting up / not answering in time) or offline (no connection) */
+  connection: ConnectionState
+  /**
+   * Whether the browser agreed to keep this app's offline data out of automatic clean-ups (storage.persist).
+   * null = not known / not supported. Even when true, data can still be removed (e.g. clearing site data).
+   */
+  storagePersisted: boolean | null
+  /** when the data on screen came from this device's saved copy (opened offline): when that copy was saved */
+  offlineDataFrom: string | null
+  /** changes made offline that the server doesn't have yet, oldest first */
+  outbox: OutboxOp[]
+  /** 'pending' while a bill or product has changes waiting; 'failed' / 'conflict' when the server refused one */
+  syncStateOf: (id: string) => OutboxOp['status'] | undefined
+  syncNow: () => void
+  /** drops a waiting change (sync panel) */
+  discardChange: (seq: number) => Promise<void>
+  /**
+   * Sends a refused change again. `keepMine`: override a newer change made on another device (conflict);
+   * `asMe` (administrators): send a change whose maker can't be verified under the administrator's own name.
+   */
+  retryChange: (seq: number, mode?: 'retry' | 'keepMine' | 'asMe') => Promise<void>
 }
 
 interface Data {
@@ -93,6 +125,38 @@ const pageFromHash = (): Page => {
 }
 
 const byDateDesc = (a: Bill, b: Bill) => b.date.localeCompare(a.date) || b.invoiceNo.localeCompare(a.invoiceNo)
+const byName = (a: { name: string }, b: { name: string }) => a.name.localeCompare(b.name)
+const digitsOf = (phone: string) => phone.replace(/\D/g, '')
+
+/** Records with unsynced changes, as they look on this device (see src/offline/db.ts) */
+interface Local {
+  bills: Bill[]
+  products: Product[]
+  customers: Customer[]
+  ops: OutboxOp[]
+}
+const NO_LOCAL: Local = { bills: [], products: [], customers: [], ops: [] }
+
+/** Set when signing out offline: the server still has to be told, on the next start with a connection */
+const SIGN_OUT_PENDING = 'bd.signOutPending'
+
+/** How long the app waits for a (possibly sleeping) server at start before opening the copy saved on this device */
+const STARTUP_WAIT_MS = 12_000
+
+/**
+ * Asks the browser to keep this app's data (including bills not yet synced) out of automatic clean-ups when the
+ * device runs low on storage. Browsers may refuse, ask the user, or still clear data (e.g. "clear site data"), so
+ * this lowers the risk but is never a guarantee. Returns whether storage is persistent, or null if unknown.
+ */
+async function persistStorage(): Promise<boolean | null> {
+  try {
+    if (!navigator.storage?.persisted) return null
+    if (await navigator.storage.persisted()) return true
+    return await navigator.storage.persist()
+  } catch {
+    return null
+  }
+}
 
 /** Every bill from the database (the screens filter and total them, as before). */
 async function loadAllBills(): Promise<Bill[]> {
@@ -113,12 +177,63 @@ export function AppProvider({ children }: { children: ReactNode }) {
   const [printJob, setPrintJob] = useState<AppState['printJob']>(null)
   const [newBillRequest, setNewBillRequest] = useState(0)
   const [createOpened, setCreateOpened] = useState(0)
+  const online = useOnline()
+  const connection = useConnectionState()
+  /** when set, the data on screen is this device's saved copy (opened offline), saved at this time */
+  const [offlineDataFrom, setOfflineDataFrom] = useState<string | null>(null)
+  const [local, setLocal] = useState<Local>(NO_LOCAL)
+  /** server-signed proof of who is signed in, stored with every change made offline */
+  const [attribution, setAttribution] = useState<{ userId: string; token: string } | undefined>(undefined)
+  const [storagePersisted, setStoragePersisted] = useState<boolean | null>(null)
+  const hasData = useRef(false)
+  useEffect(() => {
+    hasData.current = !!data
+  }, [data])
+
+  /*
+   * Writes of this device's copy of the server data run one at a time, newest wins: a write that was overtaken by
+   * newer data is skipped, so an older copy can never be saved over a newer one.
+   */
+  const snapshots = useRef({ chain: Promise.resolve(), generation: 0 })
+  const writeSnapshot = useCallback((d: Data) => {
+    const w = snapshots.current
+    const mine = ++w.generation
+    const { authRequired: _a, ...snapshot } = d
+    w.chain = w.chain.then(() => (mine === w.generation ? saveSnapshot(snapshot) : undefined)).catch(() => {})
+    return w.chain
+  }, [])
+
+  /** Opens with this device's saved copy when the server can't be reached. False if there is none. */
+  const startOffline = useCallback(async () => {
+    const snap = await loadSnapshot().catch(() => null)
+    if (!snap) return false
+    const { savedAt, ...rest } = snap
+    setData({ ...rest, authRequired: true })
+    setOfflineDataFrom(savedAt || new Date().toISOString())
+    const saved = await loadAttribution(snap.user.id).catch(() => undefined)
+    setAttribution(saved && { userId: saved.userId, token: saved.token })
+    setNeedsLogin(false)
+    return true
+  }, [])
+
+  /** Proof of who is signed in, for changes made offline later; kept on the device with the data copy */
+  const refreshAttribution = useCallback(async (userId: string) => {
+    try {
+      const a = await api.offlineAttribution()
+      setAttribution({ userId, token: a.token })
+      await saveAttribution({ userId, ...a })
+    } catch {
+      // keep the proof saved earlier (if any); offline changes without one wait for their maker to sign in
+      const saved = await loadAttribution(userId).catch(() => undefined)
+      setAttribution(saved && { userId, token: saved.token })
+    }
+  }, [])
 
   const load = useCallback(async () => {
     setLoadError(null)
     try {
       const [boot, bills] = await Promise.all([api.bootstrap(), loadAllBills()])
-      setData({
+      const next: Data = {
         settings: boot.settings,
         products: boot.products,
         customers: boot.customers,
@@ -128,25 +243,92 @@ export function AppProvider({ children }: { children: ReactNode }) {
         bills,
         nextInvoiceNo: boot.nextInvoiceNo,
         authRequired: true,
-      })
+      }
+      setData(next)
+      // signed in successfully: an earlier offline sign-out no longer needs finishing (it would end this session)
+      localStorage.removeItem(SIGN_OUT_PENDING)
+      setOfflineDataFrom(null)
       setNeedsLogin(false)
+      // save the copy at once (not only after a pause), so the app can open offline straight away
+      void writeSnapshot(next)
+      void refreshAttribution(boot.user.id)
+      void persistStorage().then(setStoragePersisted)
       connectLive()
+      requestSync(0)
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) return setNeedsLogin(true)
+      // no connection: keep what is on screen, or open with the copy saved on this device
+      if (isNetworkError(err) && (hasData.current || (await startOffline()))) return
       setLoadError(err instanceof Error ? err.message : 'Could not load data')
     }
-  }, [])
+  }, [startOffline, writeSnapshot, refreshAttribution])
 
   useEffect(() => {
-    // session expired mid-use: drop to the sign-in screen (the unsaved bill draft is kept in this browser)
+    // session expired mid-use: drop to the sign-in screen (the unsaved bill draft is kept in this browser).
+    // The saved copy is forgotten so the app can't be opened offline without signing in again; changes waiting
+    // to sync are kept and sent after the next sign-in.
     setSignedOutHandler(() => {
       disconnectLive()
       setNeedsLogin(true)
       setData(null)
+      void clearSnapshot().catch(() => {})
     })
-    // continue the session from the sign-in cookie, if there is one
-    refreshSession().then((s) => (s ? load() : setNeedsLogin(true)))
-  }, [load])
+    ;(async () => {
+      // signed out while offline last time: finish signing out on the server before anything else
+      if (localStorage.getItem(SIGN_OUT_PENDING)) {
+        if (await api.logout()) localStorage.removeItem(SIGN_OUT_PENDING)
+        return setNeedsLogin(true)
+      }
+      // continue the session from the sign-in cookie, if there is one; without a connection, open the saved copy.
+      // A sleeping server can take a minute to answer: after a while, open the saved copy meanwhile and let the
+      // sign-in finish in the background (it is never cut off, so the sign-in cookie is never lost).
+      const refresh = refreshSession()
+      const first = await Promise.race([refresh, new Promise<'slow'>((r) => setTimeout(() => r('slow'), STARTUP_WAIT_MS))])
+      if (first === 'slow') {
+        reportNetworkError('timeout')
+        if (await startOffline()) {
+          void refresh.then((s) => s && load())
+          return
+        }
+      }
+      const s = first === 'slow' ? await refresh : first
+      if (s) return load()
+      if (refreshFailedOffline() && (await startOffline())) return
+      setNeedsLogin(true)
+    })()
+  }, [load, startOffline])
+
+  // Records with unsynced changes, kept in step with IndexedDB (also across open tabs)
+  useEffect(() => {
+    const sub = liveQuery(async () => ({
+      bills: await db.localBills.toArray(),
+      products: await db.localProducts.toArray(),
+      customers: await db.localCustomers.toArray(),
+      ops: await db.outbox.orderBy('seq').toArray(),
+    })).subscribe({ next: setLocal, error: () => {} })
+    return () => sub.unsubscribe()
+  }, [])
+
+  // Keep this device's copy of the server data up to date, so the app can open offline with recent figures.
+  // Changes are written shortly after they arrive (several in a burst are written once), and at once when the
+  // page is hidden or closed.
+  useEffect(() => {
+    if (!data || offlineDataFrom) return
+    const t = setTimeout(() => void writeSnapshot(data), 500)
+    const flush = () => {
+      if (document.visibilityState === 'hidden') {
+        clearTimeout(t)
+        void writeSnapshot(data)
+      }
+    }
+    document.addEventListener('visibilitychange', flush)
+    window.addEventListener('pagehide', flush)
+    return () => {
+      clearTimeout(t)
+      document.removeEventListener('visibilitychange', flush)
+      window.removeEventListener('pagehide', flush)
+    }
+  }, [data, offlineDataFrom, writeSnapshot])
 
   const navigate = useCallback((p: Page) => {
     window.location.hash = `/${p}`
@@ -223,10 +405,106 @@ export function AppProvider({ children }: { children: ReactNode }) {
     }
   }, [signedIn, patch, refreshNextInvoice])
 
+  // Sync: send changes made offline whenever there is a connection, then reload the server's figures
+  const userIdRef = useRef<string | undefined>(undefined)
+  useEffect(() => {
+    userIdRef.current = data?.user.id
+  }, [data?.user.id])
+  const loadRef = useRef(load)
+  useEffect(() => {
+    loadRef.current = load
+  }, [load])
+  useEffect(() => {
+    if (!signedIn) return
+    setSyncHandlers({
+      userId: () => userIdRef.current,
+      onBill: (bill) => patch((d) => ({ bills: [bill, ...d.bills.filter((b) => b.id !== bill.id)].sort(byDateDesc) })),
+      onProduct: (p) => patch((d) => ({ products: [...d.products.filter((x) => x.id !== p.id), p].sort(byName) })),
+      onFinished: (synced, refused) => {
+        // say which change was refused and why, so the cashier can act on it (Sync panel)
+        for (const op of refused.slice(0, 2)) toast(`Not synced: ${op.label}. ${op.error ?? ''}`, 'error')
+        if (refused.length > 2) toast(`${refused.length - 2} more changes need attention: open Sync`, 'error')
+        if (!synced) return
+        toast(`${synced} offline change${synced === 1 ? '' : 's'} synced to the server`)
+        void loadRef.current()
+      },
+    })
+    requestSync(0)
+    // safety net (e.g. a change refused because the server was busy)
+    const every = setInterval(() => requestSync(0), 60_000)
+    // back online: send waiting changes and catch up on what others did meanwhile
+    const off = onReconnect(() => {
+      requestSync(0)
+      void loadRef.current()
+    })
+    return () => {
+      setSyncHandlers(null)
+      clearInterval(every)
+      off()
+    }
+  }, [signedIn, patch, toast])
+
   const value = useMemo<AppState | null>(() => {
     if (!data) return null
     const upsertBill = (bill: Bill) =>
       patch((d) => ({ bills: [bill, ...d.bills.filter((b) => b.id !== bill.id)].sort(byDateDesc) }))
+
+    /* ----- what the screens show: the server's data with this device's unsynced changes on top ----- */
+    const localBillIds = new Set(local.bills.map((b) => b.id))
+    const bills = local.bills.length ? [...data.bills.filter((b) => !localBillIds.has(b.id)), ...local.bills].sort(byDateDesc) : data.bills
+    const serverBill = new Map(data.bills.map((b) => [b.id, b]))
+
+    const catName = new Map(data.categories.map((c) => [c.id, c.name]))
+    const localProductIds = new Set(local.products.map((p) => p.id))
+    let products = local.products.length
+      ? [...data.products.filter((p) => !localProductIds.has(p.id)), ...local.products.map((p) => ({ ...p, categoryName: p.categoryName ?? (p.categoryId ? catName.get(p.categoryId) : undefined) }))].sort(byName)
+      : data.products
+    if (local.bills.length) {
+      // stock taken by bills not yet synced (the server's figures don't include them yet)
+      const byId = new Map(products.map((p) => [p.id, p]))
+      const taken = new Map<string, number>()
+      for (const b of local.bills) {
+        const now = stockUsed(b, byId)
+        const before = stockUsed(serverBill.get(b.id), byId)
+        for (const id of new Set([...now.keys(), ...before.keys()])) taken.set(id, (taken.get(id) ?? 0) + (now.get(id) ?? 0) - (before.get(id) ?? 0))
+      }
+      products = products.map((p) => (taken.get(p.id) ? { ...p, stock: round3(p.stock - taken.get(p.id)!) } : p))
+    }
+
+    const serverCustomerIds = new Set(data.customers.map((c) => c.id))
+    const newCustomers = local.customers.filter((c) => !serverCustomerIds.has(c.id))
+    const customers = newCustomers.length ? [...data.customers, ...newCustomers].sort(byName) : data.customers
+
+    const syncState = new Map<string, OutboxOp['status']>()
+    // a record shows its most serious state: anything refused or held outranks waiting
+    for (const op of local.ops) if ((syncState.get(op.entityId) ?? 'pending') === 'pending') syncState.set(op.entityId, op.status)
+    const waiting = (id: string) => syncState.has(id)
+
+    // the proof is used only if it is this user's (another user's may still be in memory just after switching)
+    const who = { userId: data.user.id, userName: data.user.name, attribution: attribution?.userId === data.user.id ? attribution.token : undefined }
+    const billLabel = (b: Bill) => `Bill ${b.invoiceNo} · ${b.customer.name}`
+    const afterQueue = () => {
+      requestSync(0)
+      if (!isOnline()) toast('Saved on this device. It will sync when the connection is back.', 'info')
+    }
+
+    /**
+     * A customer typed on a bill made offline: link it to a known customer with the same phone, or keep it on
+     * this device (with an id the server will also use) until the bill syncs.
+     */
+    const offlineCustomer = (input: BillInput): { input: BillInput; newCustomer?: Customer } => {
+      const c = input.customer
+      if (c.id) {
+        const pending = local.customers.find((x) => x.id === c.id)
+        // still only on this device: ask the server to create it (or link it by phone) with this bill
+        return pending ? { input: { ...input, saveCustomer: true, customer: { ...c, phone: c.phone || pending.phone } } } : { input }
+      }
+      if (!input.saveCustomer || !c.phone || c.name === 'Walk-in Customer') return { input }
+      const same = customers.find((x) => digitsOf(x.phone) === digitsOf(c.phone))
+      if (same) return { input: { ...input, customer: { ...c, id: same.id } } }
+      const newCustomer: Customer = { id: crypto.randomUUID(), name: c.name, phone: c.phone, address: c.address, gstin: c.gstin }
+      return { input: { ...input, customer: { ...c, id: newCustomer.id } }, newCustomer }
+    }
 
     return {
       page,
@@ -244,18 +522,33 @@ export function AppProvider({ children }: { children: ReactNode }) {
         refreshNextInvoice()
         return saved
       },
-      products: data.products,
-      customers: data.customers,
+      products,
+      customers,
       categories: data.categories,
       taxRates: data.taxRates,
       user: data.user,
       can: (p) => canRole(data.user.role, p),
       saveProduct: async (id, input) => {
-        const saved = id ? await api.updateProduct(id, input) : await api.createProduct(input)
-        patch((d) => ({ products: [...d.products.filter((p) => p.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)) }))
+        // a new product gets its id here, so bills made offline can use it before it reaches the server
+        const withId = id ? input : { ...input, id: crypto.randomUUID() }
+        if (!(id && waiting(id)) && isOnline()) {
+          try {
+            const saved = id ? await api.updateProduct(id, withId) : await api.createProduct(withId)
+            patch((d) => ({ products: [...d.products.filter((p) => p.id !== saved.id), saved].sort((a, b) => a.name.localeCompare(b.name)) }))
+            return saved
+          } catch (e) {
+            if (!isNetworkError(e)) throw e
+          }
+        }
+        const label = `Product ${input.name}`
+        const saved = id
+          ? await queueProductUpdate(id, input, data.products.find((p) => p.id === id) ?? products.find((p) => p.id === id)!, label, who)
+          : await queueProductCreate(withId as ProductInput & { id: string }, label, who)
+        afterQueue()
         return saved
       },
       deleteProduct: async (id) => {
+        if (waiting(id)) throw new Error('This product has changes waiting to sync. Delete it after they reach the server.')
         const r = await api.deleteProduct(id)
         patch((d) => ({ products: d.products.filter((p) => p.id !== id) }))
         return r.archived
@@ -270,33 +563,91 @@ export function AppProvider({ children }: { children: ReactNode }) {
         return c
       },
       refreshProducts,
-      bills: data.bills,
+      bills,
+      /*
+       * Bills go straight to the server when it can be reached, as before. Without a connection (or when the
+       * bill already has changes waiting, so they stay in order) the bill is saved on this device and synced later.
+       */
       saveBill: async (id, input) => {
-        const exists = id !== null && data.bills.some((b) => b.id === id)
-        const bill = exists ? await api.updateBill(id, input) : await api.createBill(input)
-        upsertBill(bill)
-        if (!exists) refreshNextInvoice()
-        // stock changed on the server: show the new figures at once (live updates also do this)
-        if (input.items.some((i) => i.productId)) refreshProducts()
-        // a new customer may have been created from the bill
-        if (input.saveCustomer && !input.customer.id) api.customers().then((customers) => patch({ customers }), () => {})
+        const current = id !== null ? bills.find((b) => b.id === id) : undefined
+        if (!current) {
+          // the bill's id is chosen here, so a retry or a later sync can never create it twice
+          const withId = { ...input, id: crypto.randomUUID() }
+          if (isOnline()) {
+            try {
+              const bill = await api.createBill(withId)
+              upsertBill(bill)
+              refreshNextInvoice()
+              // stock changed on the server: show the new figures at once (live updates also do this)
+              if (input.items.some((i) => i.productId)) refreshProducts()
+              // a new customer may have been created from the bill
+              if (input.saveCustomer && !input.customer.id) api.customers().then((customers) => patch({ customers }), () => {})
+              return bill
+            } catch (e) {
+              if (!isNetworkError(e)) throw e
+            }
+          }
+          const { input: queued, newCustomer } = offlineCustomer(withId)
+          const bill = await queueBillCreate(queued as BillInput & { id: string }, '', who, newCustomer)
+          await db.outbox.where('entityId').equals(bill.id).modify({ label: billLabel(bill) })
+          afterQueue()
+          return bill
+        }
+        if (!waiting(current.id) && isOnline()) {
+          try {
+            // a bill first saved offline: the copy being edited carries the local version, edit the server's
+            const version = input.version === LOCAL_VERSION ? serverBill.get(current.id)?.version : input.version
+            const bill = await api.updateBill(current.id, { ...input, version })
+            upsertBill(bill)
+            if (input.items.some((i) => i.productId)) refreshProducts()
+            if (input.saveCustomer && !input.customer.id) api.customers().then((customers) => patch({ customers }), () => {})
+            return bill
+          } catch (e) {
+            if (!isNetworkError(e)) throw e
+          }
+        }
+        assertEditable(current)
+        const { input: queued, newCustomer } = offlineCustomer(input)
+        const bill = await queueBillUpdate(current.id, queued, serverBill.get(current.id) ?? current, billLabel(current), who, newCustomer)
+        afterQueue()
         return bill
       },
       /** Brings the amount received up to `amountPaid` by recording the difference as a payment. */
       recordPayment: async (id, amountPaid) => {
-        const current = data.bills.find((b) => b.id === id) ?? (await api.bill(id))
+        const current = bills.find((b) => b.id === id) ?? (await api.bill(id))
         const amount = round2(Math.min(amountPaid - current.amountPaid, current.totals.balance))
         if (amount <= 0) return current
         const method = current.paymentMethod === 'Credit' ? 'Cash' : current.paymentMethod
-        const bill = await api.addPayment(id, { amount, method, clientRequestId: crypto.randomUUID() })
-        upsertBill(bill)
+        const payment: PaymentInput & { clientRequestId: string } = { amount, method, clientRequestId: crypto.randomUUID() }
+        if (!waiting(id) && isOnline()) {
+          try {
+            const bill = await api.addPayment(id, payment)
+            upsertBill(bill)
+            return bill
+          } catch (e) {
+            // the same idempotency key is reused below, so if this payment did reach the server it is saved once
+            if (!isNetworkError(e)) throw e
+          }
+        }
+        const label = `Payment ${formatMoney(amount, data.settings.currency)} · ${billLabel(current)}`
+        const bill = await queuePayment(id, { ...payment, date: new Date().toISOString() }, serverBill.get(id) ?? current, label, who)
+        afterQueue()
         return bill
       },
       deleteBill: async (id) => {
+        const ops = local.ops.filter((o) => o.entityId === id)
+        const create = ops.find((o) => o.kind === 'bill.create')
+        if (create) {
+          // made offline: if it never reached the server, deleting it here is all there is to do
+          if (create.maybeSentRev !== undefined) throw new Error('This bill may already have reached the server. Delete it once it has synced.')
+          return discardOp(create.seq!)
+        }
+        if (ops.length) throw new Error('This bill has changes waiting to sync. Delete it after they reach the server.')
         await api.deleteBill(id)
         patch((d) => ({ bills: d.bills.filter((b) => b.id !== id) }))
       },
-      nextInvoiceNo: data.nextInvoiceNo,
+      // offline, the real number is given by the server when the bill syncs (another counter may take the next one)
+      nextInvoiceNo: online ? data.nextInvoiceNo : 'Given on sync',
       money: (n, digits = 2) => formatMoney(n, data.settings.currency, digits),
       toasts,
       toast,
@@ -307,8 +658,15 @@ export function AppProvider({ children }: { children: ReactNode }) {
       finishPrintJob: () => setPrintJob(null),
       authRequired: data.authRequired,
       logout: async () => {
+        const n = local.ops.length
+        const waitingMsg = `${n} change${n === 1 ? '' : 's'} made offline ${n === 1 ? 'has' : 'have'} not reached the server yet. They stay saved on this device and sync after the next sign-in.\n\nSign out anyway?`
+        if (n && !window.confirm(waitingMsg)) return
+        const offlineMsg = "You're offline. After signing out you can't sign in again on this device until the connection is back.\n\nSign out anyway?"
+        if (!isOnline() && !window.confirm(offlineMsg)) return
         disconnectLive()
-        await api.logout().catch(() => {})
+        // offline, the server can't be told now: remember to finish signing out on the next start
+        if (!(await api.logout())) localStorage.setItem(SIGN_OUT_PENDING, '1')
+        await clearSnapshot().catch(() => {})
         setData(null)
         setNeedsLogin(true)
       },
@@ -331,8 +689,21 @@ export function AppProvider({ children }: { children: ReactNode }) {
         localStorage.removeItem('bd.draft')
         window.location.reload()
       },
+      online,
+      offlineDataFrom,
+      outbox: local.ops,
+      syncStateOf: (id) => syncState.get(id),
+      syncNow: () => void syncNow(),
+      discardChange: (seq) => discardOp(seq),
+      retryChange: async (seq, mode = 'retry') => {
+        if (mode === 'asMe' && !canRole(data.user.role, 'users.manage')) throw new Error('Only an administrator can do this')
+        await retryOp(seq, mode)
+        void syncNow()
+      },
+      connection,
+      storagePersisted,
     }
-  }, [data, page, navigate, newBillRequest, createOpened, patch, refreshNextInvoice, refreshProducts, toasts, toast, dismissToast, printJob])
+  }, [data, page, navigate, newBillRequest, createOpened, patch, refreshNextInvoice, refreshProducts, toasts, toast, dismissToast, printJob, local, online, offlineDataFrom, attribution, connection, storagePersisted])
 
   if (needsLogin) return <LoginScreen onSignedIn={load} />
   if (!value) return <StartupScreen error={loadError} onRetry={load} />

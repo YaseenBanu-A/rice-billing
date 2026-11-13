@@ -71,6 +71,19 @@ Every deploy runs `npm ci && npm run build`, and then `npm start`. The start ste
 
 **Plans:** the blueprint uses the paid **basic-256mb** database. It keeps data permanently and comes with Render's daily backups. Render's free database is deleted after 30 days, so it is not suitable for business records. The web service uses **starter**. `free` also works but sleeps after 15 idle minutes, and the first visit after that takes about a minute.
 
+## Offline use (installable app)
+
+The app is a Progressive Web App: after it has been opened once online, it can be installed (browser menu > Install / Add to Home screen) and opens without an internet connection.
+
+- **Works offline:** creating and editing bills, adding customers on a bill, recording payments, adding and editing products, viewing bills, printing and PDF. Reports and expenses show the figures last seen online.
+- **Needs a connection:** stock adjustments, deleting synced bills or products, categories, settings, users, backups and expenses changes.
+- **Sync:** changes made offline are saved in the browser (IndexedDB) and sent automatically, oldest first, when the connection returns. The status pill in the top bar and the sidebar show what is waiting; click it to open the Sync panel.
+- **Invoice numbers:** a bill made offline shows a temporary number (`PENDING-...`). The server gives it the next real invoice number when it syncs (several counters may bill offline at once, so numbers can only be given centrally). Reprint it afterwards if the customer needs the final number.
+- **No duplicates:** every bill, product and payment made offline carries its own id and idempotency key, so a change sent twice is saved once.
+- **Conflicts:** an offline edit to a bill that was changed elsewhere meanwhile is refused (version check) and shown in the Sync panel to keep either version. Product edits are merged field by field; only a field changed on both sides is a conflict.
+- **Signing out** keeps unsynced changes on the device (they sync after the next sign-in) but forgets the saved data, so the app can't be opened offline again until someone signs in online.
+- Code: `src/offline/` (IndexedDB, outbox, sync), `src/components/SyncStatus.tsx`, service worker settings in `vite.config.ts`. Server tests: `tests/offline.test.ts`.
+
 ## Backups
 
 - **Render:** daily automatic backups of the paid database (Dashboard → aj-rice-db → Recovery).

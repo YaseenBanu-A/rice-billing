@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect } from 'react'
 import { Layout } from './components/Layout'
 import { PrintHost } from './components/PrintHost'
 import { Toaster } from './components/Toaster'
+import { UpdatePrompt } from './components/UpdatePrompt'
 import { BillsHistory } from './pages/BillsHistory'
 import { CreateBill } from './pages/CreateBill'
 import { Dashboard } from './pages/Dashboard'
@@ -58,8 +59,12 @@ function Shell() {
 
 export default function App() {
   return (
-    <AppProvider>
-      <Shell />
-    </AppProvider>
+    <>
+      <AppProvider>
+        <Shell />
+      </AppProvider>
+      {/* outside the provider: also offered on the sign-in screen */}
+      <UpdatePrompt />
+    </>
   )
 }

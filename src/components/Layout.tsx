@@ -9,6 +9,7 @@ const DEMO_PRICE = Number(import.meta.env.VITE_DEMO_PRICE ?? 0)
 import { useApp } from '../store/AppContext'
 import type { Page } from '../types'
 import { BusinessMark } from './BusinessMark'
+import { ConnectionPill, OfflineBanner, SidebarConnection } from './SyncStatus'
 import { ThemeIconToggle, ThemeToggle } from './ThemeToggle'
 import { cn } from './ui'
 
@@ -101,13 +102,17 @@ function SidebarBody({ onNavigate }: { onNavigate?: () => void }) {
       <p className="px-3 pb-2 text-[10px] font-semibold tracking-[0.14em] text-slate-500 uppercase">Workspace</p>
       <NavList onNavigate={onNavigate} />
       <div className="mt-auto rounded-2xl border border-white/[0.06] bg-white/[0.03] p-4">
-        <div className="flex items-center gap-2">
-          <span className="relative flex size-2">
-            <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-50" />
-            <span className="relative inline-flex size-2 rounded-full bg-emerald-400" />
-          </span>
-          <p className="text-xs font-medium text-white/90">{DEMO ? 'Demo mode' : 'Connected to server'}</p>
-        </div>
+        {DEMO ? (
+          <div className="flex items-center gap-2">
+            <span className="relative flex size-2">
+              <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-400 opacity-50" />
+              <span className="relative inline-flex size-2 rounded-full bg-emerald-400" />
+            </span>
+            <p className="text-xs font-medium text-white/90">Demo mode</p>
+          </div>
+        ) : (
+          <SidebarConnection />
+        )}
         <p className="mt-1.5 text-xs leading-relaxed text-slate-400">
           Prices {settings.gstInclusive ? 'include' : 'exclude'} GST · default rate {settings.defaultGst}%
         </p>
@@ -149,6 +154,7 @@ export function Layout({ children }: { children: ReactNode }) {
       <header className="sticky top-0 z-30 flex h-14 items-center justify-between bg-ink-950 px-4 lg:hidden">
         <Brand />
         <div className="flex items-center gap-1">
+          <ConnectionPill dark />
           <ThemeIconToggle />
           {authRequired && (
             <button onClick={logout} className="rounded-lg p-2 text-slate-300 hover:bg-white/10" aria-label="Log out" title="Log out">
@@ -190,6 +196,7 @@ export function Layout({ children }: { children: ReactNode }) {
               <CalendarDays className="size-4 text-ink-400" />
               {today}
             </div>
+            <ConnectionPill />
             <ThemeToggle />
             {authRequired && (
               <button
@@ -202,6 +209,7 @@ export function Layout({ children }: { children: ReactNode }) {
             )}
           </div>
         </div>
+        <OfflineBanner />
         {DEMO && (
           <div className="flex flex-wrap items-center justify-center gap-x-3 gap-y-1 border-b border-amber-200 bg-amber-50 px-4 py-2 text-center text-xs text-amber-800">
             <span>

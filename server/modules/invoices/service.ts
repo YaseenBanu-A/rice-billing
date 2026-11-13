@@ -3,7 +3,7 @@ import type { Bill, BillInput, BillItem, BillPage, PaymentInput, PaymentStatus, 
 import { prisma, transaction, type Tx } from '../../db.ts'
 import type { Prisma } from '../../generated/prisma/client.ts'
 import { audit, type Actor } from '../../lib/audit.ts'
-import { badRequest, conflict, notFound } from '../../lib/errors.ts'
+import { badRequest, conflict, notFound, uniqueConstraintOf } from '../../lib/errors.ts'
 import { dateKeyWhere } from '../../lib/http.ts'
 import { allocateNumber, peekNumber } from '../../lib/numbering.ts'
 import { iso, n, nOpt, nul, opt, round2, round3, toDateKey } from '../../lib/num.ts'
@@ -266,7 +266,8 @@ async function resolveCustomer(tx: Tx, input: BillInput, actor: Actor): Promise<
   if (!input.saveCustomer || !c.phone || c.name === 'Walk-in Customer') return null
   const existing = await tx.customer.findUnique({ where: { phoneDigits: phoneDigits(c.phone) }, select: { id: true } })
   if (existing) return existing.id
-  return (await insertCustomer(tx, { name: c.name, phone: c.phone, email: '', address: c.address ?? '', gstin: c.gstin ?? '' }, actor)).id
+  // a customer added offline arrives with the id the app gave it, so its other offline bills link to the same record
+  return (await insertCustomer(tx, { name: c.name, phone: c.phone, email: '', address: c.address ?? '', gstin: c.gstin ?? '' }, actor, c.id)).id
 }
 
 const header = (input: BillInput, customerId: string | null) => ({
@@ -284,25 +285,80 @@ const header = (input: BillInput, customerId: string | null) => ({
   notes: nul(input.notes),
 })
 
-const isUniqueClash = (e: unknown, field: string) => {
-  const err = e as { code?: string; meta?: { target?: unknown; driverAdapterError?: unknown } }
-  return err?.code === 'P2002' && JSON.stringify(err.meta ?? {}).includes(field)
-}
-
 /* ---------- create / edit ---------- */
 
 /**
+ * True when a saved bill is exactly what `input` asks for: same day, customer, lines, discount, payment method,
+ * notes and amount received at billing. A resend of the same request always matches; anything else does not.
+ */
+function sameRequest(row: Row, input: BillInput): boolean {
+  const totals = computeTotals(input)
+  const paidAtBilling = round2(row.payments.filter((p) => p.note === 'Paid at billing').reduce((s, p) => s + n(p.amount), 0))
+  const head =
+    // the bill's day, not its exact time: the app stamps the current time of day on every send, so a resend of
+    // the same bill seconds later carries a slightly different time
+    row.dateKey === toDateKey(input.date) &&
+    row.customerName === input.customer.name &&
+    row.customerPhone === input.customer.phone &&
+    (row.customerAddress ?? null) === nul(input.customer.address) &&
+    (row.customerGstin ?? null) === nul(input.customer.gstin) &&
+    row.discountType === input.discountType &&
+    n(row.discountValue) === round2(input.discountValue) &&
+    row.gstInclusive === input.gstInclusive &&
+    row.paymentMethod === input.paymentMethod &&
+    (row.notes ?? null) === nul(input.notes) &&
+    paidAtBilling === round2(Math.min(totals.paid, totals.grandTotal)) &&
+    n(row.changeReturned) === round2(Math.max(totals.paid - totals.grandTotal, 0)) &&
+    row.items.length === input.items.length
+  return (
+    head &&
+    input.items.every((it, i) => {
+      const r = row.items[i]
+      return (
+        (r.productId ?? '') === (it.productId || '') &&
+        r.name === it.name &&
+        n(r.price) === round2(it.price) &&
+        n(r.quantity) === round3(it.quantity) &&
+        r.unit === (it.unit ?? '') &&
+        (r.bags === null ? null : n(r.bags)) === (it.bags ?? null) &&
+        n(r.gstRate) === it.gstRate
+      )
+    })
+  )
+}
+
+/**
+ * The bill already saved by an earlier send of this same request (double click, retry after a lost answer,
+ * offline sync), or null if there is none. A request only counts as "the same" when it carries the same
+ * idempotency key and the same contents; an id or key reused for anything else is refused, never merged, so new
+ * lines or payments are never dropped in favour of an older bill.
+ */
+async function findResent(db: Tx, input: BillInput): Promise<Row | null> {
+  const byId = input.id ? await db.invoice.findUnique({ where: { id: input.id }, include: billInclude }) : null
+  const byKey = input.clientRequestId ? await db.invoice.findUnique({ where: { clientRequestId: input.clientRequestId }, include: billInclude }) : null
+  if (!byId && !byKey) return null
+  const row = byId ?? byKey!
+  if ((byId && byKey && byId.id !== byKey.id) || !input.clientRequestId || row.clientRequestId !== input.clientRequestId)
+    throw conflict('Another bill already uses this id. Nothing was saved.', 'id_conflict')
+  if (!sameRequest(row, input))
+    throw conflict(`Bill ${row.invoiceNo} was already saved from this request with different contents. Nothing was changed.`, 'idempotency_mismatch')
+  return row
+}
+
+/** Unique constraints that mean "this exact bill was saved by a send running at the same moment" */
+const RESENT_BILL = new Set(['Invoice_pkey', 'Invoice_clientRequestId_key'])
+
+/**
  * Creates a bill in one transaction: invoice number, lines, stock deduction, first payment and audit entry.
- * Resending the same `clientRequestId` (double click, retry after a network drop) returns the first bill.
+ * Resending the same `clientRequestId` or `id` (double click, retry after a network drop, offline sync)
+ * returns the first bill.
  */
 export async function createBill(input: BillInput, actor: Actor): Promise<{ bill: Bill; created: boolean }> {
   const settings = await getSettings()
   try {
     return await transaction(async (tx) => {
-      if (input.clientRequestId) {
-        const existing = await tx.invoice.findUnique({ where: { clientRequestId: input.clientRequestId }, include: billInclude })
-        if (existing) return { bill: toBill(existing), created: false }
-      }
+      const existing = await findResent(tx, input)
+      if (existing) return { bill: toBill(existing), created: false }
       const totals = computeFor(input)
       const products = await checkItems(tx, input)
       const invoiceNo = await allocateNumber(tx, 'invoice', settings.invoicePrefix, invoiceTaken(tx))
@@ -311,6 +367,7 @@ export async function createBill(input: BillInput, actor: Actor): Promise<{ bill
 
       const inv = await tx.invoice.create({
         data: {
+          ...(input.id ? { id: input.id } : {}),
           ...header(input, customerId),
           invoiceNo,
           subtotal: totals.subtotal,
@@ -337,9 +394,11 @@ export async function createBill(input: BillInput, actor: Actor): Promise<{ bill
       return { bill: await loadBill(tx, inv.id), created: true }
     })
   } catch (e) {
-    // the same request arrived twice at the same moment: the other one won, return its bill
-    if (input.clientRequestId && isUniqueClash(e, 'clientRequestId')) {
-      const existing = await prisma.invoice.findUnique({ where: { clientRequestId: input.clientRequestId }, include: billInclude })
+    // the same request arrived twice at the same moment: the other one won (and was committed before this
+    // insert failed). Return its bill only if it really is the same request; any other clash (e.g. a customer's
+    // phone number) is rethrown untouched.
+    if (RESENT_BILL.has(uniqueConstraintOf(e) ?? '')) {
+      const existing = await findResent(prisma, input)
       if (existing) return { bill: toBill(existing), created: false }
     }
     throw e
@@ -402,13 +461,20 @@ export async function updateBill(id: string, input: BillInput, actor: Actor): Pr
 /* ---------- payments ---------- */
 
 /** Records money received against a bill (partial or full). Can't exceed the balance due. */
+/** A payment already saved by an earlier send of this same request; a key reused for another payment is refused */
+async function resentPayment(db: Tx, id: string, p: PaymentInput) {
+  if (!p.clientRequestId) return null
+  const dup = await db.payment.findUnique({ where: { clientRequestId: p.clientRequestId } })
+  if (!dup) return null
+  if (dup.invoiceId !== id || n(dup.amount) !== round2(p.amount) || dup.method !== p.method)
+    throw conflict('This payment key was already used for a different payment. Nothing was saved.', 'idempotency_mismatch')
+  return dup
+}
+
 export async function addPayment(id: string, p: PaymentInput, actor: Actor): Promise<{ bill: Bill; created: boolean }> {
   try {
     return await transaction(async (tx) => {
-      if (p.clientRequestId) {
-        const dup = await tx.payment.findUnique({ where: { clientRequestId: p.clientRequestId } })
-        if (dup) return { bill: await loadBill(tx, dup.invoiceId ?? id), created: false }
-      }
+      if (await resentPayment(tx, id, p)) return { bill: await loadBill(tx, id), created: false }
       await lockInvoice(tx, id)
       const inv = await tx.invoice.findUniqueOrThrow({ where: { id } })
       if (inv.cancelledAt) throw conflict('This bill is cancelled')
@@ -434,7 +500,7 @@ export async function addPayment(id: string, p: PaymentInput, actor: Actor): Pro
       return { bill: await loadBill(tx, id), created: true }
     })
   } catch (e) {
-    if (p.clientRequestId && isUniqueClash(e, 'clientRequestId')) return { bill: await getBill(id), created: false }
+    if (uniqueConstraintOf(e) === 'Payment_clientRequestId_key' && (await resentPayment(prisma, id, p))) return { bill: await getBill(id), created: false }
     throw e
   }
 }

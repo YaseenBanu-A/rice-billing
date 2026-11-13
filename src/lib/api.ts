@@ -24,6 +24,8 @@ import type {
   TaxRate,
   User,
 } from '../types'
+import { reportNetworkError, reportServerResponse } from '../offline/connection'
+import { cachedResponse, cacheResponse } from '../offline/db'
 
 /*
  * Talks to the billing server. The short-lived access token lives only in memory (never in localStorage);
@@ -68,17 +70,25 @@ export interface Session {
 }
 
 let refreshing: Promise<Session | null> | null = null
+let lastRefreshUnreachable = false
+
+/** True when the last refreshSession() got no session because the server couldn't be reached (not because it said no) */
+export const refreshFailedOffline = () => lastRefreshUnreachable
 
 /** Gets a new access token from the refresh cookie. Concurrent callers share one request. */
 export function refreshSession(): Promise<Session | null> {
   refreshing ??= (async () => {
     try {
       const res = await fetch(`${API_BASE}/api/auth/refresh`, { method: 'POST', credentials: 'include', headers: { 'X-Requested-With': 'ajrice' } })
+      lastRefreshUnreachable = false
+      reportServerResponse()
       if (!res.ok) return null
       const s = (await res.json()) as Session
       setAccessToken(s.accessToken)
       return s
     } catch {
+      lastRefreshUnreachable = true
+      reportNetworkError()
       return null
     } finally {
       setTimeout(() => (refreshing = null), 0)
@@ -94,32 +104,72 @@ interface RawBody {
   name: string
 }
 
-async function send(method: string, path: string, body?: unknown, raw?: RawBody): Promise<Response> {
+/**
+ * How long reads and offline-capable saves (bills, payments, products) wait for an answer. A sleeping Render
+ * server can take up to a minute to start; rather than leave the counter waiting, the save is kept on this device
+ * after this long and synced once the server answers. It is resent with the same id and idempotency key, so if
+ * the first send did reach the server, the bill is still saved only once.
+ * Other changes (settings, stock, expenses…) and sign-in requests have no time limit, as before: they have no
+ * offline copy, and giving up early would report a failure for something the server may still save.
+ */
+const TIMEOUT_MS = 25_000
+
+class Timeout extends Error {}
+
+async function send(method: string, path: string, body?: unknown, raw?: RawBody, timeoutMs?: number): Promise<Response> {
   const headers: Record<string, string> = { 'X-Requested-With': 'ajrice' }
   if (raw) {
     headers['Content-Type'] = raw.type
     headers['X-File-Name'] = encodeURIComponent(raw.name)
   } else if (body !== undefined) headers['Content-Type'] = 'application/json'
   if (accessToken) headers.Authorization = `Bearer ${accessToken}`
-  return fetch(`${API_BASE}/api${path}`, { method, headers, credentials: 'include', body: raw ? raw.file : body === undefined ? undefined : JSON.stringify(body) })
+  const ctl = timeoutMs ? new AbortController() : undefined
+  const timer = ctl && setTimeout(() => ctl.abort(), timeoutMs)
+  try {
+    return await fetch(`${API_BASE}/api${path}`, { method, headers, credentials: 'include', signal: ctl?.signal, body: raw ? raw.file : body === undefined ? undefined : JSON.stringify(body) })
+  } catch (e) {
+    throw ctl?.signal.aborted ? new Timeout() : e
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
-async function request<T>(method: string, path: string, body?: unknown, opts: { raw?: RawBody; blob?: boolean } = {}): Promise<T> {
+/** No answer from the server at all (offline, server down or too slow): status 0 */
+export const isNetworkError = (e: unknown) => e instanceof ApiError && e.status === 0
+
+/**
+ * `cache`: for read-only screens (reports, expenses). The answer is kept in this browser, and returned when the
+ * server can't be reached, so those screens show the last figures seen instead of an error while offline.
+ */
+async function request<T>(method: string, path: string, body?: unknown, opts: { raw?: RawBody; blob?: boolean; cache?: boolean; timed?: boolean } = {}): Promise<T> {
   let res: Response
+  // reads may always give up: nothing changes on the server
+  const timeout = opts.timed || method === 'GET' ? TIMEOUT_MS : undefined
   try {
-    res = await send(method, path, body, opts.raw)
+    res = await send(method, path, body, opts.raw, timeout)
     if (res.status === 401 && !path.startsWith('/auth/')) {
       const s = await refreshSession()
       if (!s) {
+        if (refreshFailedOffline()) throw new ApiError(0, 'Cannot reach the billing server. Check your internet connection.')
         setAccessToken(null)
         onSignedOut?.()
         throw new ApiError(401, 'Please sign in again')
       }
-      res = await send(method, path, body, opts.raw)
+      res = await send(method, path, body, opts.raw, timeout)
     }
+    reportServerResponse()
   } catch (e) {
+    if (e instanceof ApiError && e.status !== 0) throw e
+    const slow = e instanceof Timeout
+    if (!(e instanceof ApiError)) reportNetworkError(slow ? 'timeout' : 'unreachable')
+    if (opts.cache) {
+      const hit = await cachedResponse(path)
+      if (hit) return hit.data as T
+    }
     if (e instanceof ApiError) throw e
-    throw new ApiError(0, 'Cannot reach the billing server. Check your internet connection.')
+    throw slow
+      ? new ApiError(0, 'The billing server is taking too long to answer (it may be starting up).', undefined, 'timeout')
+      : new ApiError(0, 'Cannot reach the billing server. Check your internet connection.')
   }
   if (res.status === 204) return undefined as T
   if (opts.blob && res.ok) return (await res.blob()) as T
@@ -129,8 +179,13 @@ async function request<T>(method: string, path: string, body?: unknown, opts: { 
     if (res.status === 401 && !path.startsWith('/auth/')) onSignedOut?.()
     throw new ApiError(res.status, err?.error ?? `Request failed (${res.status})`, err?.fields, err?.code)
   }
+  if (opts.cache) void cacheResponse(path, data)
   return data as T
 }
+
+const cached = { cache: true }
+/** saves that have an offline copy: allowed to give up after TIMEOUT_MS (see above) */
+const timed = { timed: true }
 
 const enc = encodeURIComponent
 const query = (params: Record<string, string | number | boolean | undefined>) => {
@@ -143,6 +198,8 @@ const query = (params: Record<string, string | number | boolean | undefined>) =>
 
 /** What the inventory form sends. Stock is set with `openingStock` on create, and through adjustments afterwards. */
 export interface ProductInput {
+  /** new products only: id chosen by the app (UUID), so bills made offline can use the product before it syncs */
+  id?: string
   name: string
   sku: string
   categoryId?: string
@@ -180,9 +237,14 @@ export const api = {
     setAccessToken(s.accessToken)
     return s
   },
+  /** Resolves to false when the server couldn't be told (offline): the sign-in cookie is then still valid there */
   logout: async () => {
-    await request('POST', '/auth/logout').catch(() => {})
+    const confirmed = await request('POST', '/auth/logout').then(
+      () => true,
+      (e) => !isNetworkError(e),
+    )
     setAccessToken(null)
+    return confirmed
   },
   changePassword: async (currentPassword: string, newPassword: string) => {
     const s = await request<Session>('POST', '/auth/password', { currentPassword, newPassword })
@@ -195,13 +257,16 @@ export const api = {
   nextInvoiceNo: () => request<{ invoiceNo: string }>('GET', '/invoices/next').then((r) => r.invoiceNo),
   customers: () => request<Customer[]>('GET', '/customers'),
   products: () => request<Product[]>('GET', '/products'),
+  product: (id: string) => request<Product>('GET', `/products/${enc(id)}`),
+  /** proof of who is signed in, kept with changes made offline (see server/modules/auth/attribution.ts) */
+  offlineAttribution: () => request<{ token: string; expiresAt: string }>('GET', '/offline-attribution'),
 
   /* inventory: products are the same records the bill screen searches and sells from */
-  createProduct: (p: ProductInput) => request<Product>('POST', '/products', p),
-  updateProduct: (id: string, p: ProductInput) => request<Product>('PUT', `/products/${enc(id)}`, p),
+  createProduct: (p: ProductInput) => request<Product>('POST', '/products', p, timed),
+  updateProduct: (id: string, p: ProductInput) => request<Product>('PUT', `/products/${enc(id)}`, p, timed),
   /** products already used on bills or stock history are archived (hidden) instead of deleted */
   deleteProduct: (id: string) => request<{ archived: boolean }>('DELETE', `/products/${enc(id)}`),
-  categories: () => request<Category[]>('GET', '/categories'),
+  categories: () => request<Category[]>('GET', '/categories', undefined, cached),
   createCategory: (name: string) => request<Category>('POST', '/categories', { name }),
   /** mode "set" = counted stock; "add"/"remove" = a quantity in the product's unit. A reason is required. */
   adjustStock: (a: { productId: string; mode: 'set' | 'add' | 'remove'; quantity: number; note: string }) =>
@@ -210,15 +275,15 @@ export const api = {
   /* bills */
   bills: (q: { limit?: number; offset?: number } = {}) => request<BillPage>('GET', `/bills${query({ ...q })}`),
   bill: (id: string) => request<Bill>('GET', `/bills/${enc(id)}`),
-  createBill: (input: BillInput) => request<Bill>('POST', '/bills', input),
-  updateBill: (id: string, input: BillInput) => request<Bill>('PUT', `/bills/${enc(id)}`, input),
-  addPayment: (id: string, p: PaymentInput) => request<Bill>('POST', `/bills/${enc(id)}/payments`, p),
+  createBill: (input: BillInput) => request<Bill>('POST', '/bills', input, timed),
+  updateBill: (id: string, input: BillInput) => request<Bill>('PUT', `/bills/${enc(id)}`, input, timed),
+  addPayment: (id: string, p: PaymentInput) => request<Bill>('POST', `/bills/${enc(id)}/payments`, p, timed),
   deleteBill: (id: string) => request<void>('DELETE', `/bills/${enc(id)}`),
 
   /* expenses */
   expenses: (q: { q?: string; categoryId?: string; method?: string; from?: string; to?: string; limit?: number; offset?: number } = {}) =>
-    request<ExpensePage>('GET', `/expenses${query(q)}`),
-  expenseSummary: (from: string, to: string) => request<ExpenseSummary>('GET', `/expenses/summary${query({ from, to })}`),
+    request<ExpensePage>('GET', `/expenses${query(q)}`, undefined, cached),
+  expenseSummary: (from: string, to: string) => request<ExpenseSummary>('GET', `/expenses/summary${query({ from, to })}`, undefined, cached),
   createExpense: (e: ExpenseInput) => request<Expense>('POST', '/expenses', e),
   updateExpense: (id: string, e: ExpenseInput) => request<Expense>('PUT', `/expenses/${enc(id)}`, e),
   deleteExpense: (id: string) => request<void>('DELETE', `/expenses/${enc(id)}`),
@@ -226,18 +291,18 @@ export const api = {
     request<ExpenseAttachmentInfo>('PUT', `/expenses/${enc(id)}/attachment`, undefined, { raw: { file, type: file.type, name } }),
   receipt: (id: string) => request<Blob>('GET', `/expenses/${enc(id)}/attachment`, undefined, { blob: true }),
   deleteReceipt: (id: string) => request<void>('DELETE', `/expenses/${enc(id)}/attachment`),
-  expenseCategories: () => request<ExpenseCategory[]>('GET', '/expense-categories'),
+  expenseCategories: () => request<ExpenseCategory[]>('GET', '/expense-categories', undefined, cached),
   createExpenseCategory: (name: string) => request<ExpenseCategory>('POST', '/expense-categories', { name }),
   updateExpenseCategory: (id: string, c: { name: string; active: boolean }) => request<ExpenseCategory>('PUT', `/expense-categories/${enc(id)}`, c),
   /** a category with expenses is archived (hidden from new entries) instead of deleted */
   deleteExpenseCategory: (id: string) => request<{ archived: boolean }>('DELETE', `/expense-categories/${enc(id)}`),
 
   /* reports: every figure comes from the database; `from`/`to` are yyyy-mm-dd, inclusive */
-  reportSummary: (from: string, to: string) => request<ReportSummary>('GET', `/reports/summary${query({ from, to })}`),
-  invoiceReport: (from: string, to: string) => request<ReportRows<InvoiceReportRow>>('GET', `/reports/invoices${query({ from, to })}`),
-  customerReport: (from: string, to: string) => request<ReportRows<CustomerReportRow>>('GET', `/reports/customers${query({ from, to })}`),
-  paymentReport: (from: string, to: string) => request<ReportRows<PaymentReportRow>>('GET', `/reports/payments${query({ from, to })}`),
-  outstandingReport: () => request<ReportRows<OutstandingRow>>('GET', '/reports/outstanding'),
+  reportSummary: (from: string, to: string) => request<ReportSummary>('GET', `/reports/summary${query({ from, to })}`, undefined, cached),
+  invoiceReport: (from: string, to: string) => request<ReportRows<InvoiceReportRow>>('GET', `/reports/invoices${query({ from, to })}`, undefined, cached),
+  customerReport: (from: string, to: string) => request<ReportRows<CustomerReportRow>>('GET', `/reports/customers${query({ from, to })}`, undefined, cached),
+  paymentReport: (from: string, to: string) => request<ReportRows<PaymentReportRow>>('GET', `/reports/payments${query({ from, to })}`, undefined, cached),
+  outstandingReport: () => request<ReportRows<OutstandingRow>>('GET', '/reports/outstanding', undefined, cached),
 
   /* backup & reset */
   backup: () => request<Backup>('GET', '/backup'),

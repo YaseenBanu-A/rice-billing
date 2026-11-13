@@ -329,6 +329,8 @@ export type BillItemInput = Omit<BillItem, 'id' | 'returnedQty'> & { id?: string
 
 /** What the client sends to create or update a bill. Totals, status and invoice number are set by the server. */
 export interface BillInput {
+  /** new bills only: id chosen by the client (UUID), so a bill made offline keeps its id after syncing */
+  id?: string
   date: string // ISO
   customer: BillCustomer
   /** Create a customer record from `customer` if it has no id */

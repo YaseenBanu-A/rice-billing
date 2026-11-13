@@ -1,7 +1,7 @@
 import { BILL_METHODS, PAY_METHODS } from '../../../shared/billing.ts'
 import type { BillInput, BillItemInput, DiscountType, PaymentInput, PaymentMethod, PayMethod, ReturnInput } from '../../../shared/types.ts'
 import { badRequest } from '../../lib/errors.ts'
-import { asObject, fail, gstinError, isoDate, notFuture, number, phoneError, requestKey, text } from '../../lib/validate.ts'
+import { asObject, clientId, fail, gstinError, isoDate, notFuture, number, phoneError, requestKey, text } from '../../lib/validate.ts'
 
 export function validateBillInput(raw: unknown): BillInput {
   const b = asObject(raw)
@@ -36,9 +36,11 @@ export function validateBillInput(raw: unknown): BillInput {
 
   const date = isoDate(b.date)
   const input: BillInput = {
+    id: clientId(b.id),
     date: date.toISOString(),
     customer: {
-      id: text(cust.id, 64) || undefined,
+      // customer ids are UUIDs; anything else would fail the database lookup
+      id: clientId(cust.id),
       name: text(cust.name, 120) || 'Walk-in Customer',
       phone: text(cust.phone, 40),
       address: text(cust.address, 500) || undefined,

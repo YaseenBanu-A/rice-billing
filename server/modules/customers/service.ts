@@ -64,10 +64,10 @@ export async function getCustomer(id: string): Promise<Customer> {
   return toCustomer(r, (await statsFor([id])).get(id) ?? { outstanding: 0, billCount: 0 })
 }
 
-/** Used when a bill is saved with "Save as new customer" */
-export async function insertCustomer(tx: Tx, c: CustomerData, actor: Actor | null) {
+/** Used when a bill is saved with "Save as new customer". `id`: one chosen by the offline app (UUID). */
+export async function insertCustomer(tx: Tx, c: CustomerData, actor: Actor | null, id?: string) {
   await assertPhoneFree(tx, c.phone)
-  const r = await tx.customer.create({ data: dataOf(c) })
+  const r = await tx.customer.create({ data: { ...(id ? { id } : {}), ...dataOf(c) } })
   await audit(tx, actor, 'customer.create', 'customer', r.id, { name: c.name, phone: c.phone })
   return r
 }

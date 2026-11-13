@@ -1,6 +1,7 @@
 import type { Request, Response } from 'express'
 import type { PaymentStatus } from '../../../shared/types.ts'
 import { actorOf } from '../../lib/audit.ts'
+import { attributedActor } from '../auth/attribution.ts'
 import { badRequest } from '../../lib/errors.ts'
 import { dateRange, paging, param, qs } from '../../lib/http.ts'
 import { broadcast } from '../../realtime.ts'
@@ -30,8 +31,11 @@ export async function next(_req: Request, res: Response) {
 
 const touchesStock = (b: { items: { productId: string }[] }) => b.items.some((i) => i.productId)
 
+/** Offline changes carry proof of who made them (see auth/attribution.ts) */
+const proofOf = (req: Request) => (req.body as { offlineAttribution?: unknown } | undefined)?.offlineAttribution
+
 export async function create(req: Request, res: Response) {
-  const actor = actorOf(req)
+  const actor = await attributedActor(req, proofOf(req), 'bills.create')
   const { bill, created } = await s.createBill(validateBillInput(req.body), actor)
   if (created) {
     broadcast({ entity: 'invoice', action: 'create', id: bill.id, label: bill.invoiceNo }, actor)
@@ -41,7 +45,7 @@ export async function create(req: Request, res: Response) {
 }
 
 export async function update(req: Request, res: Response) {
-  const actor = actorOf(req)
+  const actor = await attributedActor(req, proofOf(req), 'bills.edit')
   const bill = await s.updateBill(param(req, 'id'), validateBillInput(req.body), actor)
   broadcast({ entity: 'invoice', action: 'update', id: bill.id, label: bill.invoiceNo }, actor)
   if (touchesStock(bill)) broadcast({ entity: 'stock', action: 'sale-edit', id: bill.id }, actor)
@@ -49,7 +53,7 @@ export async function update(req: Request, res: Response) {
 }
 
 export async function pay(req: Request, res: Response) {
-  const actor = actorOf(req)
+  const actor = await attributedActor(req, proofOf(req), 'payments.record')
   const { bill, created } = await s.addPayment(param(req, 'id'), validatePayment(req.body), actor)
   if (created) broadcast({ entity: 'payment', action: 'create', id: bill.id, label: bill.invoiceNo }, actor)
   res.status(created ? 201 : 200).json(bill)

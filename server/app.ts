@@ -8,6 +8,7 @@ import { apiNotFound, errorHandler } from './middleware/errors.ts'
 import { requestLog } from './middleware/requestLog.ts'
 import { apiLimiter, corsPolicy, requireAppHeader, securityHeaders } from './middleware/security.ts'
 import { adminRoutes } from './modules/admin/routes.ts'
+import { attributionToken } from './modules/auth/attribution.ts'
 import { authRoutes } from './modules/auth/routes.ts'
 import { customerRoutes } from './modules/customers/routes.ts'
 import { expenseRoutes } from './modules/expenses/routes.ts'
@@ -27,6 +28,8 @@ export function createApp() {
   app.use(securityHeaders)
 
   const api = Router()
+  // API answers hold business data: never stored by the browser, the service worker or any proxy
+  api.use((_req, res, next) => (res.setHeader('Cache-Control', 'no-store'), next()))
   api.use(corsPolicy)
   api.use(requestLog)
   api.use(apiLimiter)
@@ -44,6 +47,7 @@ export function createApp() {
 
   // everything below requires a signed-in user; each route checks its own permission
   api.use(authenticate)
+  api.get('/offline-attribution', attributionToken)
   for (const routes of [adminRoutes, settingsRoutes, userRoutes, customerRoutes, supplierRoutes, productRoutes, inventoryRoutes, invoiceRoutes, purchaseRoutes, expenseRoutes, reportRoutes])
     api.use(routes)
   api.use(apiNotFound)
@@ -53,7 +57,17 @@ export function createApp() {
   if (fs.existsSync(path.join(config.staticDir, 'index.html'))) {
     // hashed assets can be cached for a long time; index.html must always be fresh
     app.use('/assets', express.static(path.join(config.staticDir, 'assets'), { immutable: true, maxAge: '365d' }))
-    app.use(express.static(config.staticDir, { index: false, maxAge: '1h' }))
+    // the service worker and app manifest must always be checked for a new version (offline app updates)
+    const alwaysFresh = new Set(['sw.js', 'manifest.webmanifest'])
+    app.use(
+      express.static(config.staticDir, {
+        index: false,
+        maxAge: '1h',
+        setHeaders: (res, file) => {
+          if (alwaysFresh.has(path.basename(file))) res.setHeader('Cache-Control', 'no-cache')
+        },
+      }),
+    )
     app.get(/^\/(?!api\/|socket\.io\/).*/, (_req, res) => {
       res.setHeader('Cache-Control', 'no-cache')
       res.sendFile(path.join(config.staticDir, 'index.html'))

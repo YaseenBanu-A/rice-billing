@@ -1,5 +1,6 @@
 import type { Request, Response } from 'express'
 import { actorOf } from '../../lib/audit.ts'
+import { attributedActor } from '../auth/attribution.ts'
 import { param, qs } from '../../lib/http.ts'
 import { broadcast } from '../../realtime.ts'
 import * as s from './service.ts'
@@ -20,14 +21,16 @@ export async function get(req: Request, res: Response) {
 }
 
 export async function create(req: Request, res: Response) {
-  const p = await s.createProduct(req.body, actorOf(req))
-  broadcast({ entity: 'product', action: 'create', id: p.id, label: p.name }, actorOf(req))
-  res.status(201).json(p)
+  const actor = await attributedActor(req, req.body?.offlineAttribution, 'products.manage')
+  const { product: p, created } = await s.createProduct(req.body, actor)
+  if (created) broadcast({ entity: 'product', action: 'create', id: p.id, label: p.name }, actor)
+  res.status(created ? 201 : 200).json(p)
 }
 
 export async function update(req: Request, res: Response) {
-  const p = await s.updateProduct(param(req, 'id'), req.body, actorOf(req))
-  broadcast({ entity: 'product', action: 'update', id: p.id, label: p.name }, actorOf(req))
+  const actor = await attributedActor(req, req.body?.offlineAttribution, 'products.manage')
+  const p = await s.updateProduct(param(req, 'id'), req.body, actor)
+  broadcast({ entity: 'product', action: 'update', id: p.id, label: p.name }, actor)
   res.json(p)
 }
 
